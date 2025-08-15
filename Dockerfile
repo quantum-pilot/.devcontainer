@@ -33,8 +33,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   unzip \
   vim \
   yq \
-  zsh \
-  && apt-get clean && rm -rf /var/lib/apt/lists/*
+  zsh
+
+# Additional dependencies for playwright MCP server
+ARG ENABLE_PLAYWRIGHT_MCP=false
+RUN if [ "${ENABLE_PLAYWRIGHT_MCP}" = "true" ]; then \
+    apt-get install -y --no-install-recommends libnspr4 libnss3 libdbus-1-3 libatk1.0-0 \
+    libatk-bridge2.0-0 libcups2 libxkbcommon0 libatspi2.0-0 \
+    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
+    libx11-xcb1 libxcursor1 libgtk-3-0 libgdk-pixbuf2.0-0 \
+    libgstreamer1.0-0 libgtk-4-1 libgraphene-1.0-0 libwoff1 \
+    libvpx7 libopus0 libgstreamer-plugins-base1.0-0 \
+    libgstreamer-plugins-bad1.0-0 gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-libav flite libavif15 libharfbuzz-icu0 \
+    libenchant-2-2 libsecret-1-0 libhyphen0 libmanette-0.2-0 \
+    libgles2 libx264-dev libxss1 libdrm2 libglib2.0-0 \
+    libpango-1.0-0 libpangocairo-1.0-0 libcairo2 \
+    libfreetype6 libfontconfig1 libwebp7 libwebpdemux2; \
+  fi
+
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Configure sudoers for the user (node user already exists in base image)
 RUN echo ${USERNAME} ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/${USERNAME} && \
@@ -163,6 +182,12 @@ RUN npm install -g @openai/codex@${OPENAI_CODEX_VERSION}
 
 # Install claude-monitor
 RUN uv tool install claude-monitor
+
+# Install playwright if enabled
+RUN if [ "${ENABLE_PLAYWRIGHT_MCP}" = "true" ]; then \
+    npm i -g @playwright/mcp@latest && \
+    npx playwright install; \
+fi
 
 USER root
 COPY scripts/* /usr/local/bin/

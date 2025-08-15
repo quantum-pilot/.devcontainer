@@ -1,0 +1,34 @@
+#!/usr/bin/env -S LC_ALL=C bash
+
+# Declare global vars for MCP servers to be used
+
+set -eo pipefail
+GW_IP=$(getent hosts host.docker.internal | awk '{print $1}')
+if [[ -z "$GW_IP" ]]; then
+  echo "❌ Cannot resolve host.docker.internal" >&2
+  exit 1
+fi
+
+substitute() {
+  local str=$1
+  local pattern='___([A-Za-z0-9_]+)___'
+
+  while [[ $str =~ $pattern ]]; do
+    local var=${BASH_REMATCH[1]}
+    local repl=${!var:-___${var}___}   # leave placeholder if env-var is unset
+    str=${str//___${var}___/$repl}
+  done
+  printf '%s' "$str"
+}
+
+NEW_ARGS=()
+for arg in "$@"; do
+  NEW_ARGS+=("$(substitute "$arg")")
+done
+
+if [[ ${#NEW_ARGS[@]} -eq 0 ]]; then
+  echo "container-mcp-wrapper: no command supplied" >&2
+  exit 1
+fi
+
+exec "${NEW_ARGS[@]}"

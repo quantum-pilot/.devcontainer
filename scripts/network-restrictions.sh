@@ -39,6 +39,7 @@ ALLOW_DNS=$(echo "$CONFIG" | jq -r '.allow_dns // true')
 ALLOW_SSH=$(echo "$CONFIG" | jq -r '.allow_ssh // true')
 ALLOW_LOCALHOST=$(echo "$CONFIG" | jq -r '.allow_localhost // true')
 ALLOW_HOST_NETWORK=$(echo "$CONFIG" | jq -r '.allow_host_network // true')
+ALLOW_DOCKER=$(echo "$CONFIG" | jq -r '.allow_docker // true')
 
 log_info "Starting network restrictions setup..."
 
@@ -114,10 +115,10 @@ if [[ -n "$ALLOWED_DOMAINS" ]]; then
     echo "$ALLOWED_DOMAINS" | while read -r domain; do
         if [[ -n "$domain" ]]; then
             log_info "Resolving domain: $domain"
-            
+
             # Resolve IPv4 addresses
             IP_LIST=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || echo "")
-            
+
             if [[ -n "$IP_LIST" ]]; then
                 echo "$IP_LIST" | while read -r ip; do
                     log_info "  Adding IP: $ip"
@@ -133,24 +134,24 @@ fi
 # Handle host network access
 if [[ "$ALLOW_HOST_NETWORK" == "true" ]]; then
     log_info "Detecting host network..."
-    
+
     # Try multiple methods to detect host network
     HOST_IP=""
-    
+
     # Method 1: Default route
     HOST_IP=$(ip route show default 2>/dev/null | grep -oP 'via \K[0-9.]+' | head -1 || echo "")
-    
+
     # Method 2: Docker host gateway
     if [[ -z "$HOST_IP" ]]; then
         HOST_IP=$(getent hosts host.docker.internal 2>/dev/null | awk '{print $1}' | head -1 || echo "")
     fi
-    
+
     if [[ -n "$HOST_IP" ]]; then
         # Allow host gateway
         log_info "Allowing host gateway: $HOST_IP"
         iptables -I OUTPUT -d "$HOST_IP" -j ACCEPT
         iptables -I INPUT -s "$HOST_IP" -j ACCEPT
-        
+
         # Allow host subnet (assuming /24)
         HOST_SUBNET=$(echo "$HOST_IP" | sed 's/\.[0-9]*$/.0\/24/')
         log_info "Allowing host subnet: $HOST_SUBNET"
@@ -164,6 +165,13 @@ fi
 log_info "Applying network whitelist rules..."
 iptables -A OUTPUT -m set --match-set network-whitelist dst -j ACCEPT
 iptables -A INPUT -m set --match-set network-whitelist src -j ACCEPT
+
+# Allow Docker network (if enabled)
+if [[ "$ALLOW_DOCKER" == "true" ]]; then
+    log_info "Allowing Docker network..."
+    HOST_GATEWAY=$(getent hosts host.docker.internal | awk '{print $1}')
+    iptables -A OUTPUT -d "$HOST_GATEWAY" -j ACCEPT
+fi
 
 # Set default policies
 log_info "Setting default policies to DROP..."

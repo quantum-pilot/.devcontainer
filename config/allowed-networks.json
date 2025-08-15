@@ -16,5 +16,6 @@
     "allow_dns": true,
     "allow_ssh": true,
     "allow_localhost": true,
-    "allow_host_network": true
+    "allow_host_network": true,
+    "allow_docker": true
 }
