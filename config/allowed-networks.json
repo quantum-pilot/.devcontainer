@@ -1,0 +1,20 @@
+{
+    "allowed_domains": [
+        "github.com",
+        "api.github.com",
+        "raw.githubusercontent.com",
+        "proxy.golang.org",
+        "registry.npmjs.org",
+        "api.anthropic.com",
+        "api.openai.com",
+        "sentry.io",
+        "statsig.anthropic.com",
+        "json.schemastore.org",
+        "statsig.com"
+    ],
+    "allowed_networks": [],
+    "allow_dns": true,
+    "allow_ssh": true,
+    "allow_localhost": true,
+    "allow_host_network": true
+}

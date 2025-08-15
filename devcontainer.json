@@ -1,0 +1,73 @@
+{
+  "name": "Vibe Coding Dev Container",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "ENABLE_GO": "true",
+      "ENABLE_RUST": "true",
+      "ENABLE_PYTHON": "true",
+      // "GO_VERSION": "1.25.0",
+      // "GO_ARCH": "amd64",
+      // "RUST_VERSION": "stable",
+      // "PYTHON_VERSION": "3.11",
+      // "TZ": "UTC",
+      // "CLAUDE_CODE_VERSION": "latest",
+      // "OPENAI_CODEX_VERSION": "latest",
+      // "GIT_DELTA_VERSION": "0.18.2",
+      // "ZSH_IN_DOCKER_VERSION": "1.2.0",
+      "USERNAME": "node"
+    }
+  },
+  "remoteUser": "node",
+  "runArgs": [
+    // network restrictions
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    // debugging
+    "--cap-add=SYS_PTRACE",
+    "--security-opt=seccomp=unconfined",
+    // other container access
+    "--add-host=host.docker.internal:host-gateway"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "rust-lang.rust-analyzer",
+        "ms-python.vscode-pylance",
+        "ms-python.python",
+        "ms-python.debugpy",
+        "ms-python.vscode-python-envs",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        // "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.codeActionsOnSave": {
+          "source.fixAll.eslint": "explicit"
+        },
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "zsh"
+          }
+        }
+      }
+    }
+  },
+  "mounts": [
+    // persist home - shell history, claude and codex config
+    "source=shell_history-${devcontainerId},target=/shell_history,type=volume",
+    "source=claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
+    "source=codex-config-${devcontainerId},target=/home/node/.codex,type=volume"
+  ],
+  "containerEnv": {
+    "NODE_OPTIONS": "--max-old-space-size=4096",
+    "CLAUDE_CONFIG_DIR": "/home/node/.claude"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
+  "workspaceFolder": "/workspace",
+  "postCreateCommand": "sudo /usr/local/bin/network-restrictions.sh" // remove this to remove firewall
+}
