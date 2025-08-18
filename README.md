@@ -8,7 +8,7 @@ Inspiration from [Claude Code](https://github.com/anthropics/claude-code/blob/ma
 
 1. Clone into your project workspace: `git clone https://github.com/quantum-pilot/.devcontainer` and remove `.git` directory (you can also download the zip file directly and unzip). If checking this into your repository is not desirable, add it to `.gitignore`.
 
-2. Enable the languages you need by editing `devcontainer.json`:
+2. Enable the languages you need (and relevant extensions) by editing `devcontainer.json`:
    ```jsonc
    "args": {
      "ENABLE_GO": "true",

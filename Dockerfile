@@ -1,6 +1,7 @@
 # Always use Node as base image
 FROM node:24
 
+ARG TARGETARCH
 # Least likely to change - system setup
 ARG USERNAME=node
 ARG USER_UID=1000
@@ -34,6 +35,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   vim \
   yq \
   zsh
+
+# Enable cross-compilation for arm64 (some go deps have issues)
+RUN set -eux; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      dpkg --add-architecture amd64; \
+      apt-get install -y --no-install-recommends \
+        gcc-x86-64-linux-gnu libc6-dev-amd64-cross; \
+    fi
 
 # Additional dependencies for playwright MCP server
 ARG ENABLE_PLAYWRIGHT_MCP=false
@@ -159,14 +168,6 @@ RUN if [ "${ENABLE_RUST}" = "true" ]; then \
   fi
 
 USER ${USERNAME}
-
-# Install language-specific tools
-RUN if [ "${ENABLE_GO}" = "true" ] && command -v go >/dev/null 2>&1; then \
-    echo "Installing Go tools..."; \
-    go install -v golang.org/x/tools/gopls@latest; \
-    go install -v golang.org/x/tools/cmd/goimports@latest; \
-    # go install -v honnef.co/go/tools/cmd/staticcheck@latest; \
-  fi
 
 RUN if [ "${ENABLE_PYTHON}" = "true" ] && command -v pip3 >/dev/null 2>&1; then \
     echo "Installing Python tools..." && \

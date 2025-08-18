@@ -4,6 +4,7 @@
         "api.github.com",
         "raw.githubusercontent.com",
         "proxy.golang.org",
+        "sum.golang.org",
         "registry.npmjs.org",
         "api.anthropic.com",
         "api.openai.com",
