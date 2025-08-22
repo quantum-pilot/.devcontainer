@@ -115,11 +115,14 @@ USER ${USERNAME}
 RUN HISTORY="export PROMPT_COMMAND='history -a' && export HISTFILE=/shell_history/.bash_history"
 
 # This only adds to your user config - you can always force add these files with `git add -f`
-RUN mkdir -p ~/.config/git && \
-  echo 'CLAUDE.md' >> ~/.config/git/ignore && \
-  echo '.claude' >> ~/.config/git/ignore && \
-  echo '.devcontainer' >> ~/.config/git/ignore && \
-  echo 'AGENTS.md' >>  ~/.config/git/ignore
+ARG IGNORE_AGENT_FILES=true
+RUN if [ "${IGNORE_AGENT_FILES}" = "true" ]; then \
+    mkdir -p ~/.config/git && \
+    echo 'CLAUDE.md' >> ~/.config/git/ignore && \
+    echo '.claude' >> ~/.config/git/ignore && \
+    echo '.devcontainer' >> ~/.config/git/ignore && \
+    echo 'AGENTS.md' >>  ~/.config/git/ignore; \
+  fi
 
 # zsh customizations
 ARG ZSH_IN_DOCKER_VERSION=1.2.0
