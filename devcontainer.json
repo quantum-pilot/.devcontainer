@@ -8,6 +8,7 @@
       // "ENABLE_PYTHON": "false",
       // "ENABLE_PLAYWRIGHT_MCP": "false",
       // "ENABLE_GH_CLI": "false",
+      // "IGNORE_AGENT_FILES": "true",
       // "TZ": "America/Los_Angeles",
       // "GO_VERSION": "1.25.0",
       // "GO_ARCH": "amd64",
