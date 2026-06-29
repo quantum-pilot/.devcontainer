@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import sys
+import uuid
+
+
+REQUEST_DIR = pathlib.Path(os.environ.get("JAIL_REQUEST_DIR", "/jail-requests"))
+SSH_LEASE_DIR = pathlib.Path(os.environ.get("JAIL_SSH_LEASE_DIR", "/jail-ssh-leases"))
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def write_request(kind, payload):
+    REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    request_id = f"{utc_now().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    path = REQUEST_DIR / f"{request_id}.json"
+    request = {
+        "id": request_id,
+        "kind": kind,
+        "created_at": utc_now().isoformat(),
+        "cwd": os.getcwd(),
+        "payload": payload,
+    }
+    path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"request written: {path}")
+    print("approve from the host with the matching host/jail-* broker command")
+    return 0
+
+
+def process_tree():
+    tree = []
+    pid = os.getpid()
+    while pid > 1:
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as fh:
+                stat = fh.read().split()
+            ppid = int(stat[3])
+            comm = stat[1].strip("()")
+        except (OSError, IndexError, ValueError):
+            break
+        tree.append({"pid": pid, "comm": comm})
+        pid = ppid
+    return tree
+
+
+def session_scope():
+    return {
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "sid": os.getsid(0),
+        "pgid": os.getpgrp(),
+        "uid": os.getuid(),
+        "tree": process_tree(),
+    }
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def parse_expiry(value):
+    if not value:
+        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return dt.datetime.fromisoformat(value)
+
+
+def live_ssh_lease(alias):
+    now = utc_now()
+    sid = os.getsid(0)
+    pgid = os.getpgrp()
+    candidates = []
+    for path in sorted(SSH_LEASE_DIR.glob("*.json")):
+        lease = read_json(path)
+        if not isinstance(lease, dict):
+            continue
+        if lease.get("alias") != alias:
+            continue
+        expires_at = parse_expiry(lease.get("expires_at"))
+        if expires_at and now >= expires_at:
+            continue
+        scope = lease.get("scope", {})
+        if scope.get("sid") == sid or scope.get("pgid") == pgid:
+            candidates.append((path, lease))
+    return candidates[-1] if candidates else (None, None)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def lockfiles(root):
+    names = [
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "uv.lock",
+        "poetry.lock",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "Cargo.lock",
+        "go.sum",
+    ]
+    found = []
+    root_path = pathlib.Path(root)
+    for name in names:
+        path = root_path / name
+        if path.is_file():
+            found.append({"path": str(path), "sha256": file_sha256(path)})
+    return found
+
+
+def cmd_egress(args):
+    return write_request("egress", {
+        "host": args.host,
+        "port": args.port,
+        "protocols": args.protocol,
+        "ttl": args.ttl,
+        "reason": args.reason,
+    })
+
+
+def cmd_ssh(args):
+    lease_path, lease = live_ssh_lease(args.alias)
+    if lease:
+        print(f"ssh lease active: {lease_path}")
+        print("open the matching host-side SSH broker session; no new approval request was created")
+        if args.command:
+            print(f"requested remote command: {args.command}")
+        return 0
+
+    return write_request("ssh", {
+        "alias": args.alias,
+        "remote_command": args.command,
+        "lease": {
+            "requested": args.lease,
+            "scope": session_scope(),
+            "ttl": args.ttl,
+        },
+        "features": {
+            "agent_forwarding": False,
+            "x11_forwarding": False,
+            "port_forwarding": False,
+        },
+    })
+
+
+def cmd_install(args):
+    return write_request("install", {
+        "manager": args.manager,
+        "arguments": args.arguments,
+        "project": os.getcwd(),
+        "lockfiles": lockfiles(os.getcwd()),
+    })
+
+
+def cmd_ssh_lease(args):
+    return write_request("ssh-lease", {
+        "alias": args.alias,
+        "ttl": args.ttl,
+        "scope": session_scope(),
+        "features": {
+            "agent_forwarding": False,
+            "x11_forwarding": False,
+            "port_forwarding": False,
+        },
+    })
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Submit hardened jail broker requests")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    egress = sub.add_parser("egress", help="request temporary host/port egress")
+    egress.add_argument("host")
+    egress.add_argument("--port", type=int, default=443)
+    egress.add_argument("--protocol", action="append", choices=["connect", "http"], default=["connect"])
+    egress.add_argument("--ttl", default="10m")
+    egress.add_argument("--reason", default="")
+    egress.set_defaults(func=cmd_egress)
+
+    ssh = sub.add_parser("ssh", help="request an approved host-side SSH session")
+    ssh.add_argument("alias")
+    ssh.add_argument("--command", default="")
+    ssh.add_argument("--lease", action="store_true", help="request a reusable lease for this process session")
+    ssh.add_argument("--ttl", default="30m")
+    ssh.set_defaults(func=cmd_ssh)
+
+    lease = sub.add_parser("ssh-lease", help="request a reusable SSH lease for this process session")
+    lease.add_argument("alias")
+    lease.add_argument("--ttl", default="30m")
+    lease.set_defaults(func=cmd_ssh_lease)
+
+    install = sub.add_parser("install", help="request a brokered package/tool install")
+    install.add_argument("manager", choices=["npm", "pnpm", "yarn", "pip", "uv", "cargo", "go", "mise"])
+    install.add_argument("arguments", nargs=argparse.REMAINDER)
+    install.set_defaults(func=cmd_install)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+{
+  "aliases": {
+    "staging-readonly": {
+      "host": "staging.example.internal",
+      "user": "deploy",
+      "port": 22,
+      "identity_file": "~/.ssh/id_ed25519",
+      "features": {
+        "agent_forwarding": false,
+        "x11_forwarding": false,
+        "port_forwarding": false
+      }
+    }
+  }
+}

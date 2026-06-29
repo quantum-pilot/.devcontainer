@@ -1,0 +1,71 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    tty: true
+    command: sleep infinity
+    user: node
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=1g
+      - /run:rw,nosuid,nodev,noexec,size=64m
+      - /var/tmp:rw,nosuid,nodev,noexec,size=512m
+      - /home/node/.cache:rw,nosuid,nodev,size=2g
+      - /home/node/.npm:rw,nosuid,nodev,size=1g
+      - /home/node/.local:rw,nosuid,nodev,size=1g
+    environment:
+      HTTP_PROXY: http://egress-proxy:8080
+      HTTPS_PROXY: http://egress-proxy:8080
+      ALL_PROXY: http://egress-proxy:8080
+      NO_PROXY: localhost,127.0.0.1,::1,egress-proxy
+      npm_config_proxy: http://egress-proxy:8080
+      npm_config_https_proxy: http://egress-proxy:8080
+    volumes:
+      - ..:/workspace:delegated
+      - hardened-vscode-server:/home/node/.vscode-server
+      - hardened-shell-history:/shell_history
+      - ${HOME}/.devcontainer-jail/requests:/jail-requests
+      - ${HOME}/.devcontainer-jail/policy/ssh-leases:/jail-ssh-leases:ro
+    networks:
+      - jail_net
+    depends_on:
+      - egress-proxy
+
+  egress-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    environment:
+      EGRESS_APPROVALS_FILE: /policy/approvals.json
+      EGRESS_LOG_FILE: /state/egress.log
+      EGRESS_BIND: 0.0.0.0
+      EGRESS_PORT: "8080"
+    volumes:
+      - ${HOME}/.devcontainer-jail/policy:/policy:ro
+      - ${HOME}/.devcontainer-jail/state:/state
+    networks:
+      - jail_net
+      - internet
+
+networks:
+  jail_net:
+    internal: true
+  internet:
+
+volumes:
+  hardened-vscode-server:
+  hardened-shell-history:

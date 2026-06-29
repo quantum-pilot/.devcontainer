@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import sys
+
+
+BASE = pathlib.Path(os.environ.get("JAIL_POLICY_DIR", pathlib.Path.home() / ".devcontainer-jail" / "policy"))
+APPROVALS = BASE / "approvals.json"
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_ttl(value):
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if value[-1] not in units:
+        raise argparse.ArgumentTypeError("ttl must end in s, m, h, or d")
+    return int(value[:-1]) * units[value[-1]]
+
+
+def load():
+    if not APPROVALS.exists():
+        return {"rules": []}
+    return json.loads(APPROVALS.read_text(encoding="utf-8"))
+
+
+def save(data):
+    BASE.mkdir(parents=True, exist_ok=True)
+    tmp = APPROVALS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(APPROVALS)
+
+
+def add_rule(args):
+    data = load()
+    expires = utc_now() + dt.timedelta(seconds=parse_ttl(args.ttl))
+    rule = {
+        "name": args.name or f"{args.host}:{args.port}",
+        "host": args.host,
+        "port": args.port,
+        "protocols": args.protocol,
+        "enabled": True,
+        "expires_at": expires.isoformat(),
+        "reason": args.reason,
+    }
+    data.setdefault("rules", []).append(rule)
+    save(data)
+    print(f"approved {rule['name']} until {rule['expires_at']}")
+    print(f"policy: {APPROVALS}")
+
+
+def list_rules(_args):
+    data = load()
+    for idx, rule in enumerate(data.get("rules", []), 1):
+        state = "enabled" if rule.get("enabled", True) else "disabled"
+        print(f"{idx}. {rule.get('name', 'unnamed')} {state} {rule.get('host')}:{rule.get('port')} expires={rule.get('expires_at')}")
+
+
+def prune(_args):
+    data = load()
+    now = utc_now()
+    before = len(data.get("rules", []))
+    data["rules"] = [
+        rule for rule in data.get("rules", [])
+        if not rule.get("expires_at") or dt.datetime.fromisoformat(rule["expires_at"]) > now
+    ]
+    save(data)
+    print(f"removed {before - len(data['rules'])} expired approval(s)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Manage hardened jail egress approvals")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="approve a host/port temporarily")
+    add.add_argument("host")
+    add.add_argument("--port", type=int, default=443)
+    add.add_argument("--protocol", action="append", choices=["connect", "http"], default=["connect"])
+    add.add_argument("--ttl", default="10m")
+    add.add_argument("--name", default="")
+    add.add_argument("--reason", default="")
+    add.set_defaults(func=add_rule)
+
+    ls = sub.add_parser("list", help="list approvals")
+    ls.set_defaults(func=list_rules)
+
+    pr = sub.add_parser("prune", help="remove expired approvals")
+    pr.set_defaults(func=prune)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  exec /usr/bin/ssh "$@"
+fi
+
+target=""
+remote=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -*)
+      printf 'ssh wrapper: direct ssh options are blocked in the jail; use an approved alias\n' >&2
+      exit 126
+      ;;
+    *)
+      target="$1"
+      shift
+      remote=("$@")
+      break
+      ;;
+  esac
+done
+
+if [[ -z "$target" ]]; then
+  printf 'ssh wrapper: missing alias\n' >&2
+  exit 2
+fi
+
+if [[ "$target" == *@* || "$target" == *:* || "$target" == *.* ]]; then
+  printf 'ssh wrapper: raw SSH targets are blocked; use an approved alias such as `ssh staging-readonly`\n' >&2
+  exit 126
+fi
+
+if [[ ${#remote[@]} -gt 0 ]]; then
+  exec jailctl ssh "$target" --command "${remote[*]}"
+fi
+
+exec jailctl ssh "$target"

@@ -1,0 +1,7 @@
+FROM python:3.12-alpine
+
+COPY scripts/egress-proxy.py /usr/local/bin/egress-proxy
+RUN chmod 0755 /usr/local/bin/egress-proxy
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/egress-proxy"]

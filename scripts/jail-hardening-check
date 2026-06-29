@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail=0
+
+check_fail() {
+  printf 'FAIL: %s\n' "$1"
+  fail=1
+}
+
+check_ok() {
+  printf 'OK: %s\n' "$1"
+}
+
+if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+  check_fail "passwordless sudo is available"
+else
+  check_ok "passwordless sudo unavailable"
+fi
+
+if id -nG | tr ' ' '\n' | grep -qx root; then
+  check_fail "user is in root group"
+else
+  check_ok "user is not in root group"
+fi
+
+if [[ -S /var/run/docker.sock || -S /run/docker.sock ]]; then
+  check_fail "Docker socket is mounted"
+else
+  check_ok "Docker socket absent"
+fi
+
+if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+  check_fail "SSH_AUTH_SOCK is present"
+else
+  check_ok "SSH agent socket absent"
+fi
+
+if find "$HOME/.ssh" -maxdepth 1 -type f \( -name 'id_*' ! -name '*.pub' \) 2>/dev/null | grep -q .; then
+  check_fail "SSH private key exists in home"
+else
+  check_ok "SSH private keys absent from home"
+fi
+
+if [[ -e "$HOME/.claude/.credentials.json" || -e "$HOME/.codex/auth.json" ]]; then
+  check_fail "agent credentials are mounted in worker home"
+else
+  check_ok "Claude/Codex credentials absent from worker home"
+fi
+
+if awk '/NoNewPrivs:/ { exit ($2 == 1 ? 0 : 1) }' /proc/self/status; then
+  check_ok "no_new_privs is enabled"
+else
+  check_fail "no_new_privs is not enabled"
+fi
+
+if awk '/Seccomp:/ { exit ($2 == 0 ? 1 : 0) }' /proc/self/status; then
+  check_ok "seccomp is enabled"
+else
+  check_fail "seccomp is disabled"
+fi
+
+cap_eff=$(awk '/CapEff:/ { print $2 }' /proc/self/status)
+if [[ "$cap_eff" == "0000000000000000" ]]; then
+  check_ok "effective capabilities are empty"
+else
+  check_fail "effective capabilities are not empty: $cap_eff"
+fi
+
+if [[ "${HTTP_PROXY:-}" == "http://egress-proxy:8080" && "${HTTPS_PROXY:-}" == "http://egress-proxy:8080" ]]; then
+  check_ok "proxy environment points at egress-proxy"
+else
+  check_fail "proxy environment is not configured for egress-proxy"
+fi
+
+if find / -xdev -perm /6000 -type f 2>/dev/null | grep -q .; then
+  check_fail "setuid/setgid files remain in root filesystem"
+else
+  check_ok "no setuid/setgid files found in root filesystem"
+fi
+
+exit "$fail"

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+base="${DEVCONTAINER_JAIL_HOME:-$HOME/.devcontainer-jail}"
+mkdir -p "$base/policy" "$base/policy/ssh-leases" "$base/state" "$base/requests"
+
+if [[ ! -f "$base/policy/approvals.json" ]]; then
+  cat > "$base/policy/approvals.json" <<'JSON'
+{
+  "rules": []
+}
+JSON
+fi
+
+if [[ ! -f "$base/policy/ssh-allowlist.json" ]]; then
+  cat > "$base/policy/ssh-allowlist.json" <<'JSON'
+{
+  "aliases": {}
+}
+JSON
+fi
+
+chmod 700 "$base" "$base/policy" "$base/state"
+chmod 755 "$base/policy/ssh-leases"
+chmod 1777 "$base/requests"
+chmod 600 "$base/policy/approvals.json" "$base/policy/ssh-allowlist.json"
+
+printf 'initialized hardened jail state at %s\n' "$base"
+printf 'export JAIL_POLICY_DIR=%s/policy\n' "$base"
+printf 'export JAIL_STATE_DIR=%s/state\n' "$base"
+printf 'export JAIL_REQUEST_DIR=%s/requests\n' "$base"
