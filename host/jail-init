@@ -7,6 +7,7 @@ mkdir -p "$base/policy" "$base/policy/ssh-leases" "$base/state" "$base/requests"
 if [[ ! -f "$base/policy/approvals.json" ]]; then
   cat > "$base/policy/approvals.json" <<'JSON'
 {
+  "blocks": [],
   "rules": []
 }
 JSON
@@ -15,9 +16,64 @@ fi
 if [[ ! -f "$base/policy/ssh-allowlist.json" ]]; then
   cat > "$base/policy/ssh-allowlist.json" <<'JSON'
 {
+  "blocks": {},
   "aliases": {}
 }
 JSON
+fi
+
+seed_marker="$base/policy/.default-agent-approvals-seeded"
+if [[ ! -f "$seed_marker" ]]; then
+  APPROVALS_FILE="$base/policy/approvals.json" python3 - <<'PY'
+import datetime as dt
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["APPROVALS_FILE"])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {"rules": []}
+
+rules = data.setdefault("rules", [])
+data.setdefault("blocks", [])
+now = dt.datetime.now(dt.timezone.utc).isoformat()
+defaults = [
+    "platform.claude.com",
+    "api.anthropic.com",
+    "chatgpt.com",
+    "auth.openai.com",
+    "api.openai.com",
+]
+
+def same_rule(rule, host):
+    return (
+        isinstance(rule, dict)
+        and rule.get("host") == host
+        and int(rule.get("port") or 443) == 443
+        and set(rule.get("protocols") or []) == {"connect"}
+    )
+
+for host in defaults:
+    if any(same_rule(rule, host) for rule in rules):
+        continue
+    rules.append({
+        "name": f"{host}:443",
+        "host": host,
+        "port": 443,
+        "protocols": ["connect"],
+        "enabled": True,
+        "created_at": now,
+        "approved_at": now,
+        "reason": "default agent/headroom endpoint",
+    })
+
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+tmp.replace(path)
+PY
+  touch "$seed_marker"
 fi
 
 chmod 700 "$base" "$base/policy" "$base/state"

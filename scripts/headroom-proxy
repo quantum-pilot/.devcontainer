@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HEADROOM_HOST="${HEADROOM_HOST:-127.0.0.1}"
+export HEADROOM_PORT="${HEADROOM_PORT:-8787}"
+export HEADROOM_HOME="${HEADROOM_HOME:-$HOME/.local/share/headroom}"
+export HEADROOM_LOG_FILE="${HEADROOM_LOG_FILE:-$HEADROOM_HOME/proxy.jsonl}"
+
+mkdir -p "$HEADROOM_HOME"
+
+# The proxy itself must not inherit client-side base URL overrides.
+unset ANTHROPIC_BASE_URL
+unset OPENAI_BASE_URL
+
+cd /workspace
+exec headroom proxy \
+  --host "$HEADROOM_HOST" \
+  --port "$HEADROOM_PORT" \
+  --log-file "$HEADROOM_LOG_FILE"

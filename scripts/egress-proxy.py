@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 import datetime as dt
 import fnmatch
+import hashlib
 import json
 import os
+import pathlib
 import select
 import socket
 import socketserver
 import sys
+import time
 import urllib.parse
+import uuid
 
 
 APPROVALS_FILE = os.environ.get("EGRESS_APPROVALS_FILE", "/policy/approvals.json")
 LOG_FILE = os.environ.get("EGRESS_LOG_FILE", "/state/egress.log")
+REQUEST_DIR = pathlib.Path(os.environ.get("EGRESS_REQUEST_DIR", "/jail-requests"))
 BIND = os.environ.get("EGRESS_BIND", "0.0.0.0")
 PORT = int(os.environ.get("EGRESS_PORT", "8080"))
 BUFFER_SIZE = 64 * 1024
+WAIT_FOR_APPROVAL = os.environ.get("EGRESS_WAIT_FOR_APPROVAL", "true").lower() not in {"0", "false", "no"}
+APPROVAL_WAIT_TIMEOUT = int(os.environ.get("EGRESS_APPROVAL_WAIT_TIMEOUT", "0"))
+APPROVAL_POLL_SECONDS = float(os.environ.get("EGRESS_APPROVAL_POLL_SECONDS", "1"))
 
 
 def utc_now():
@@ -40,6 +48,7 @@ def load_policy():
     if not isinstance(data, dict):
         return {"rules": [], "policy_error": "policy root must be an object"}
     data.setdefault("rules", [])
+    data.setdefault("blocks", [])
     return data
 
 
@@ -52,6 +61,141 @@ def append_log(record):
             fh.write(line + "\n")
     except OSError:
         print(line, file=sys.stderr, flush=True)
+
+
+def request_key(protocol, host, port):
+    raw = f"egress:{protocol}:{host.lower().rstrip('.')}:{int(port or 443)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def pending_request_path(key):
+    for path in REQUEST_DIR.glob("*.json"):
+        request = read_json(path)
+        if not isinstance(request, dict):
+            continue
+        if request.get("status", "pending") != "pending":
+            continue
+        if request.get("dedupe_key") == key:
+            return path
+    return None
+
+
+def write_auto_request(protocol, host, port, target, reason):
+    key = request_key(protocol, host, port)
+    try:
+        REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+        existing = pending_request_path(key)
+        if existing:
+            return existing
+        request_id = f"{utc_now().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+        request = {
+            "id": request_id,
+            "kind": "egress",
+            "status": "pending",
+            "dedupe_key": key,
+            "created_at": utc_now().isoformat(),
+            "cwd": "",
+            "source": "egress-proxy",
+            "payload": {
+                "host": host,
+                "port": int(port or 443),
+                "protocols": [protocol],
+                "ttl": "10m",
+                "reason": f"auto request after denied {protocol} to {host}:{int(port or 443)}",
+                "target": target,
+                "deny_reason": reason,
+            },
+        }
+        path = REQUEST_DIR / f"{request_id}.json"
+        path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        try:
+            path.chmod(0o666)
+        except OSError:
+            pass
+        return path
+    except OSError as exc:
+        append_log({
+            "decision": "request_error",
+            "reason": str(exc),
+            "host": host,
+            "port": port,
+            "protocol": protocol,
+            "target": target,
+        })
+        return None
+
+
+def wait_for_operator_decision(protocol, host, port, target, reason):
+    request_path = write_auto_request(protocol, host, port, target, reason)
+    if not WAIT_FOR_APPROVAL or not request_path:
+        return False, {"reason": reason, "request_path": str(request_path) if request_path else ""}
+
+    deadline = None
+    if APPROVAL_WAIT_TIMEOUT > 0:
+        deadline = time.monotonic() + APPROVAL_WAIT_TIMEOUT
+
+    append_log({
+        "decision": "wait",
+        "reason": reason,
+        "host": host,
+        "port": port,
+        "protocol": protocol,
+        "target": target,
+        "request_path": str(request_path),
+    })
+
+    while True:
+        ok, info = allowed(protocol, host, port)
+        if ok:
+            info = dict(info)
+            info["waited_for_approval"] = True
+            info["request_path"] = str(request_path)
+            return True, info
+        if info.get("reason") == "blocked":
+            info = dict(info)
+            info["request_path"] = str(request_path)
+            return False, info
+
+        request = read_json(request_path)
+        if isinstance(request, dict):
+            status = request.get("status", "pending")
+            if status == "denied":
+                return False, {
+                    "reason": "operator_denied",
+                    "detail": request.get("decision_reason", "denied by host operator"),
+                    "request_path": str(request_path),
+                }
+            if status == "approved":
+                ok, info = allowed(protocol, host, port)
+                info = dict(info)
+                info["request_path"] = str(request_path)
+                if ok:
+                    info["waited_for_approval"] = True
+                    return True, info
+                info.setdefault("detail", "request was approved, but no active matching policy rule is present")
+                return False, info
+        elif not request_path.exists():
+            return False, {
+                "reason": "request_missing",
+                "detail": "pending request disappeared before operator decision",
+                "request_path": str(request_path),
+            }
+
+        if deadline is not None and time.monotonic() >= deadline:
+            return False, {
+                "reason": "approval_timeout",
+                "detail": f"no operator decision within {APPROVAL_WAIT_TIMEOUT}s",
+                "request_path": str(request_path),
+            }
+
+        time.sleep(APPROVAL_POLL_SECONDS)
 
 
 def host_matches(rule, host):
@@ -81,10 +225,25 @@ def rule_allows(rule, protocol, host, port):
     return host_matches(rule, host)
 
 
+def rule_blocks(rule, protocol, host, port):
+    if not rule.get("enabled", True):
+        return False
+    protocols = rule.get("protocols")
+    if protocols and protocol not in protocols:
+        return False
+    rule_port = rule.get("port")
+    if rule_port is not None and int(rule_port) != int(port):
+        return False
+    return host_matches(rule, host)
+
+
 def allowed(protocol, host, port):
     policy = load_policy()
     if policy.get("policy_error"):
         return False, {"reason": "policy_error", "detail": policy["policy_error"]}
+    for rule in policy.get("blocks", []):
+        if isinstance(rule, dict) and rule_blocks(rule, protocol, host, port):
+            return False, {"reason": "blocked", "rule": rule.get("name", "unnamed")}
     for rule in policy.get("rules", []):
         if isinstance(rule, dict) and rule_allows(rule, protocol, host, port):
             return True, {"rule": rule.get("name", "unnamed")}
@@ -117,22 +276,27 @@ Reason: {reason}
 Use one of these request paths instead of retrying direct network commands:
 
   Generic HTTPS/TCP egress:
-    jailctl egress {host} --port {egress_port} --reason "<why this access is needed>"
+    A pending request has been created automatically when possible.
+    Review it from the host with:
+      .devcontainer/host/jail-operator
 
   Package/tool installs:
-    jailctl install npm ci
-    jailctl install uv sync
-    jailctl install cargo fetch
-    jailctl install go mod download
+    jailctl install --run pnpm install --frozen-lockfile
+    jailctl install --run uv sync
+    jailctl install --run cargo fetch
+    jailctl install --run go mod download
+
+  Agent login:
+    jailctl agent-login codex
+    jailctl agent-login claude
 
   SSH:
     jailctl ssh <approved-alias>
-    jailctl ssh-lease <approved-alias> --ttl 30m
+    jailctl ssh-lease <approved-alias> --ttl 30m --wait
 
-Host approval examples:
+Host approval:
 
-  .devcontainer/host/jail-approve-egress add {host} --port {egress_port} --ttl 10m --reason "<why>"
-  .devcontainer/host/jail-ssh-broker requests --kind ssh-lease
+  .devcontainer/host/jail-operator
 
 Direct egress is blocked by design. Do not retry direct installs/downloads repeatedly.
 """
@@ -185,8 +349,8 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             "port": port,
             "target": target,
             "guidance": {
-                "egress": f"jailctl egress {host} --port {int(port or 443)} --reason \"<why>\"",
-                "install": "jailctl install <manager> <args...>",
+                "egress": ".devcontainer/host/jail-operator",
+                "install": "jailctl install --run <manager> <args...>",
                 "ssh": "jailctl ssh <approved-alias>",
             },
         }
@@ -205,8 +369,16 @@ class ProxyHandler(socketserver.StreamRequestHandler):
     def handle_connect(self, host, port, target):
         ok, info = allowed("connect", host, port)
         if not ok:
+            if info.get("reason") == "default_deny":
+                ok, info = wait_for_operator_decision("connect", host, port, target, info["reason"])
+            if ok:
+                self.allow_connect(host, port, target, info)
+                return
             self.deny(info.get("reason", "default_deny"), host, port, target, {"protocol": "connect", **info})
             return
+        self.allow_connect(host, port, target, info)
+
+    def allow_connect(self, host, port, target, info):
         append_log({
             "decision": "allow",
             "protocol": "connect",
@@ -229,8 +401,16 @@ class ProxyHandler(socketserver.StreamRequestHandler):
     def handle_http(self, method, target, host, port, headers, request_line):
         ok, info = allowed("http", host, port)
         if not ok:
+            if info.get("reason") == "default_deny":
+                ok, info = wait_for_operator_decision("http", host, port, target, info["reason"])
+            if ok:
+                self.allow_http(method, target, host, port, headers, info)
+                return
             self.deny(info.get("reason", "default_deny"), host, port, target, {"protocol": "http", "method": method, **info})
             return
+        self.allow_http(method, target, host, port, headers, info)
+
+    def allow_http(self, method, target, host, port, headers, info):
         append_log({
             "decision": "allow",
             "protocol": "http",

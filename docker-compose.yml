@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     init: true
     tty: true
-    command: sleep infinity
+    command: jail-start
     user: node
     read_only: true
     cap_drop:
@@ -16,9 +16,9 @@ services:
       - /tmp:rw,nosuid,nodev,noexec,size=1g
       - /run:rw,nosuid,nodev,noexec,size=64m
       - /var/tmp:rw,nosuid,nodev,noexec,size=512m
-      - /home/node/.cache:rw,nosuid,nodev,size=2g
-      - /home/node/.npm:rw,nosuid,nodev,size=1g
-      - /home/node/.local:rw,nosuid,nodev,size=1g
+      - /home/node/.cache:rw,nosuid,nodev,uid=1000,gid=1000,size=2g
+      - /home/node/.npm:rw,nosuid,nodev,uid=1000,gid=1000,size=1g
+      - /home/node/.local:rw,nosuid,nodev,uid=1000,gid=1000,size=1g
     environment:
       HTTP_PROXY: http://egress-proxy:8080
       HTTPS_PROXY: http://egress-proxy:8080
@@ -30,8 +30,14 @@ services:
       - ..:/workspace:delegated
       - hardened-vscode-server:/home/node/.vscode-server
       - hardened-shell-history:/shell_history
-      - ${HOME}/.devcontainer-jail/requests:/jail-requests
-      - ${HOME}/.devcontainer-jail/policy/ssh-leases:/jail-ssh-leases:ro
+      - hardened-agent-claude:/home/node/.claude
+      - hardened-agent-codex:/home/node/.codex
+      - hardened-agent-state:/home/node/.agents
+      - hardened-gsd:/home/node/.gsd
+      - hardened-headroom:/home/node/.local/share/headroom
+      - hardened-pnpm:/home/node/.local/share/pnpm
+      - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/requests:/jail-requests
+      - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/policy/ssh-leases:/jail-ssh-leases:ro
     networks:
       - jail_net
     depends_on:
@@ -52,11 +58,15 @@ services:
     environment:
       EGRESS_APPROVALS_FILE: /policy/approvals.json
       EGRESS_LOG_FILE: /state/egress.log
+      EGRESS_REQUEST_DIR: /jail-requests
       EGRESS_BIND: 0.0.0.0
       EGRESS_PORT: "8080"
+      EGRESS_WAIT_FOR_APPROVAL: "true"
+      EGRESS_APPROVAL_WAIT_TIMEOUT: "0"
     volumes:
-      - ${HOME}/.devcontainer-jail/policy:/policy:ro
-      - ${HOME}/.devcontainer-jail/state:/state
+      - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/policy:/policy:ro
+      - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/state:/state
+      - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/requests:/jail-requests
     networks:
       - jail_net
       - internet
@@ -69,3 +79,9 @@ networks:
 volumes:
   hardened-vscode-server:
   hardened-shell-history:
+  hardened-agent-claude:
+  hardened-agent-codex:
+  hardened-agent-state:
+  hardened-gsd:
+  hardened-headroom:
+  hardened-pnpm:

@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+import curses
+import datetime as dt
+import json
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+import textwrap
+import uuid
+
+
+BASE = pathlib.Path(os.environ.get("DEVCONTAINER_JAIL_HOME", pathlib.Path.home() / ".devcontainer-jail"))
+POLICY_DIR = pathlib.Path(os.environ.get("JAIL_POLICY_DIR", BASE / "policy"))
+REQUEST_DIR = pathlib.Path(os.environ.get("JAIL_REQUEST_DIR", BASE / "requests"))
+APPROVALS = POLICY_DIR / "approvals.json"
+ALLOWLIST = POLICY_DIR / "ssh-allowlist.json"
+LEASE_DIR = POLICY_DIR / "ssh-leases"
+TTL_CHOICES = ["5m", "10m", "30m", "1h", "4h", "forever"]
+REFRESH_MS = 1000
+SORT_CHOICES = ["time", "alpha"]
+VIEW_CHOICES = ["pending", "approvals", "blacklist", "ssh"]
+
+PRESETS = {
+    "codex-login": [
+        {"host_suffix": ".openai.com", "port": 443, "protocols": ["connect"]},
+        {"host_suffix": ".chatgpt.com", "port": 443, "protocols": ["connect"]},
+        {"host": "api.openai.com", "port": 443, "protocols": ["connect"]},
+    ],
+    "codex-runtime": [
+        {"host": "api.openai.com", "port": 443, "protocols": ["connect"]},
+        {"host_suffix": ".openai.com", "port": 443, "protocols": ["connect"]},
+    ],
+    "claude-login": [
+        {"host_suffix": ".anthropic.com", "port": 443, "protocols": ["connect"]},
+        {"host": "claude.ai", "port": 443, "protocols": ["connect"]},
+    ],
+    "claude-runtime": [
+        {"host": "api.anthropic.com", "port": 443, "protocols": ["connect"]},
+        {"host_suffix": ".anthropic.com", "port": 443, "protocols": ["connect"]},
+    ],
+    "npm-registry": [
+        {"host": "registry.npmjs.org", "port": 443, "protocols": ["connect"]},
+        {"host_suffix": ".npmjs.org", "port": 443, "protocols": ["connect"]},
+    ],
+    "pypi": [
+        {"host": "pypi.org", "port": 443, "protocols": ["connect"]},
+        {"host": "files.pythonhosted.org", "port": 443, "protocols": ["connect"]},
+        {"host_suffix": ".pythonhosted.org", "port": 443, "protocols": ["connect"]},
+    ],
+    "github-https": [
+        {"host": "github.com", "port": 443, "protocols": ["connect"]},
+        {"host_suffix": ".github.com", "port": 443, "protocols": ["connect"]},
+        {"host_suffix": ".githubusercontent.com", "port": 443, "protocols": ["connect"]},
+    ],
+}
+
+INSTALL_PRESETS = {
+    "npm": "npm-registry",
+    "pnpm": "npm-registry",
+    "yarn": "npm-registry",
+    "pip": "pypi",
+    "uv": "pypi",
+    "cargo": "github-https",
+    "go": "github-https",
+    "mise": "github-https",
+}
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_time(value):
+    if not value:
+        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def parse_ttl(value):
+    if value in {"forever", "infinite", "inf", "never", "permanent"}:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if not value or value[-1] not in units:
+        raise ValueError("ttl must end in s, m, h, d, or be forever")
+    return int(value[:-1]) * units[value[-1]]
+
+
+def expires_for_ttl(ttl):
+    seconds = parse_ttl(ttl)
+    if seconds is None:
+        return None
+    return utc_now() + dt.timedelta(seconds=seconds)
+
+
+def ttl_label(expires_at):
+    expires = parse_time(expires_at)
+    if not expires:
+        return "forever"
+    remaining = int((expires - utc_now()).total_seconds())
+    if remaining <= 0:
+        return "expired"
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, seconds = divmod(remaining, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def timestamp_label(value):
+    parsed = parse_time(value or "")
+    if not parsed:
+        return ""
+    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def load_ssh_policy():
+    data = read_json(ALLOWLIST, {"aliases": {}, "blocks": {}})
+    if not isinstance(data, dict):
+        return {"aliases": {}, "blocks": {}}
+    aliases = data.get("aliases", {})
+    blocks = data.get("blocks", {})
+    data["aliases"] = aliases if isinstance(aliases, dict) else {}
+    data["blocks"] = blocks if isinstance(blocks, dict) else {}
+    return data
+
+
+def load_ssh_allowlist():
+    return load_ssh_policy()["aliases"]
+
+
+def ssh_blocks():
+    return load_ssh_policy()["blocks"]
+
+
+def write_ssh_policy(data):
+    data.setdefault("aliases", {})
+    data.setdefault("blocks", {})
+    write_json(ALLOWLIST, data, 0o600)
+
+
+def write_json(path, data, mode=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if mode is not None:
+        os.chmod(tmp, mode)
+    tmp.replace(path)
+
+
+def load_approvals():
+    data = read_json(APPROVALS, {"rules": [], "blocks": []})
+    if not isinstance(data, dict):
+        return {"rules": [], "blocks": []}
+    data.setdefault("rules", [])
+    data.setdefault("blocks", [])
+    return data
+
+
+def prune_expired_approvals():
+    data = load_approvals()
+    now = utc_now()
+    rules = []
+    removed = 0
+    for rule in data.get("rules", []):
+        expires_at = parse_time(rule.get("expires_at")) if isinstance(rule, dict) else None
+        if expires_at and expires_at <= now:
+            removed += 1
+            continue
+        rules.append(rule)
+    if removed:
+        data["rules"] = rules
+        write_json(APPROVALS, data, 0o600)
+    return removed
+
+
+def active_approvals(sort_mode):
+    prune_expired_approvals()
+    rows = []
+    for idx, rule in enumerate(load_approvals().get("rules", [])):
+        if not isinstance(rule, dict):
+            continue
+        if not rule.get("enabled", True):
+            continue
+        expires_at = parse_time(rule.get("expires_at"))
+        if expires_at and expires_at <= utc_now():
+            continue
+        rows.append((idx, rule))
+    if sort_mode == "alpha":
+        rows.sort(key=lambda item: approval_sort_text(item[1]))
+    else:
+        rows.sort(key=lambda item: approval_time(item[1]), reverse=True)
+    return rows
+
+
+def active_blacklist(sort_mode):
+    rows = []
+    for idx, rule in enumerate(load_approvals().get("blocks", [])):
+        if not isinstance(rule, dict):
+            continue
+        if not rule.get("enabled", True):
+            continue
+        rows.append(("egress", idx, rule))
+    for alias, entry in ssh_blocks().items():
+        if not isinstance(entry, dict):
+            entry = {"alias": alias}
+        entry.setdefault("alias", alias)
+        rows.append(("ssh", alias, entry))
+    if sort_mode == "alpha":
+        rows.sort(key=lambda item: blacklist_sort_text(item[0], item[2]))
+    else:
+        rows.sort(key=lambda item: blacklist_time(item[0], item[2]), reverse=True)
+    return rows
+
+
+def approval_time(rule):
+    return parse_time(rule.get("approved_at") or rule.get("created_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def block_time(rule):
+    return parse_time(rule.get("blocked_at") or rule.get("created_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def blacklist_time(kind, entry):
+    if kind == "ssh":
+        return parse_time(entry.get("blocked_at") or entry.get("created_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    return block_time(entry)
+
+
+def approval_sort_text(rule):
+    label = rule.get("name") or rule.get("host") or rule.get("host_suffix") or rule.get("host_glob") or ""
+    return f"{label}:{rule.get('port', '')}".lower()
+
+
+def blacklist_sort_text(kind, entry):
+    if kind == "ssh":
+        return f"ssh:{entry.get('alias', '')}:{entry.get('host', '')}".lower()
+    return f"egress:{approval_sort_text(entry)}"
+
+
+def active_ssh_aliases(sort_mode):
+    rows = list(load_ssh_allowlist().items())
+    if sort_mode == "alpha":
+        rows.sort(key=lambda item: item[0].lower())
+    else:
+        rows.sort(key=lambda item: parse_time(item[1].get("updated_at") or item[1].get("created_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
+    return rows
+
+
+def add_rules(rules, ttl, reason):
+    data = load_approvals()
+    now = utc_now()
+    expires = expires_for_ttl(ttl)
+    for rule in rules:
+        entry = dict(rule)
+        label = entry.get("host") or entry.get("host_suffix") or entry.get("host_glob") or "egress"
+        entry.setdefault("name", f"{label}:{entry.get('port', 443)}")
+        entry.setdefault("enabled", True)
+        entry.setdefault("created_at", now.isoformat())
+        entry["approved_at"] = now.isoformat()
+        if expires is None:
+            entry.pop("expires_at", None)
+        else:
+            entry["expires_at"] = expires.isoformat()
+        entry["reason"] = reason
+        data["rules"].append(entry)
+    write_json(APPROVALS, data, 0o600)
+
+
+def add_blocks(rules, reason, request=None):
+    data = load_approvals()
+    blocks = data.setdefault("blocks", [])
+    now = utc_now().isoformat()
+    added = []
+    for rule in rules:
+        entry = dict(rule)
+        label = entry.get("host") or entry.get("host_suffix") or entry.get("host_glob") or "egress"
+        entry.setdefault("name", f"{label}:{entry.get('port', 443)}")
+        entry.setdefault("enabled", True)
+        entry.setdefault("created_at", now)
+        entry["blocked_at"] = now
+        entry["reason"] = reason
+        if request:
+            entry["source_request_id"] = request.get("id", "")
+        if any(same_network_rule(existing, entry) for existing in blocks if isinstance(existing, dict)):
+            continue
+        blocks.append(entry)
+        added.append(entry)
+    write_json(APPROVALS, data, 0o600)
+    return added
+
+
+def same_network_rule(left, right):
+    left_keys = {key: left.get(key) for key in ("host", "host_suffix", "host_glob", "port")}
+    right_keys = {key: right.get(key) for key in ("host", "host_suffix", "host_glob", "port")}
+    return left_keys == right_keys and set(left.get("protocols") or []) == set(right.get("protocols") or [])
+
+
+def request_sort_time(request):
+    return parse_time(request.get("created_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def request_sort_text(path, request):
+    return f"{summarize(request)} {request.get('created_at', '')} {request.get('id', '')}".lower()
+
+
+def request_files(sort_mode):
+    found = []
+    for path in REQUEST_DIR.glob("*.json"):
+        request = read_json(path)
+        if not isinstance(request, dict):
+            continue
+        if request.get("status", "pending") != "pending":
+            continue
+        found.append((path, request))
+    if sort_mode == "alpha":
+        return sorted(found, key=lambda item: request_sort_text(item[0], item[1]))
+    return sorted(found, key=lambda item: request_sort_time(item[1]), reverse=True)
+
+
+def summarize(request):
+    kind = request.get("kind", "?")
+    payload = request.get("payload", {})
+    if kind == "egress":
+        return f"egress {payload.get('host', '?')}:{payload.get('port', 443)} {','.join(payload.get('protocols') or [])}"
+    if kind == "install":
+        args = " ".join(payload.get("arguments") or [])
+        return f"install {payload.get('manager', '?')} {args}".strip()
+    if kind == "agent-login":
+        return f"agent-login {payload.get('agent', '?')}"
+    if kind in {"ssh", "ssh-lease"}:
+        return f"{kind} {payload.get('alias', '?')}"
+    return kind
+
+
+def egress_rules_from_request(request):
+    payload = request.get("payload", {})
+    host = payload.get("host")
+    if not host:
+        return []
+    return [{
+        "host": host,
+        "port": int(payload.get("port") or 443),
+        "protocols": payload.get("protocols") or ["connect"],
+    }]
+
+
+def preset_rules(name):
+    return [dict(rule) for rule in PRESETS.get(name, [])]
+
+
+def rules_for_request(request):
+    kind = request.get("kind")
+    payload = request.get("payload", {})
+    if kind == "egress":
+        return egress_rules_from_request(request)
+    if kind == "install":
+        return preset_rules(INSTALL_PRESETS.get(payload.get("manager"), "github-https"))
+    if kind == "agent-login":
+        agent = payload.get("agent")
+        return preset_rules(f"{agent}-login")
+    return []
+
+
+def mark_request(path, request, status, reason=""):
+    updated = dict(request)
+    updated["status"] = status
+    updated["decided_at"] = utc_now().isoformat()
+    if reason:
+        updated["decision_reason"] = reason
+    write_json(path, updated, 0o666)
+
+
+def revoke_approval(rule_index):
+    data = load_approvals()
+    rules = data.get("rules", [])
+    if rule_index < 0 or rule_index >= len(rules):
+        raise ValueError("approval no longer exists")
+    removed = rules.pop(rule_index)
+    write_json(APPROVALS, data, 0o600)
+    return removed
+
+
+def revoke_block(rule_index):
+    data = load_approvals()
+    blocks = data.get("blocks", [])
+    if rule_index < 0 or rule_index >= len(blocks):
+        raise ValueError("block no longer exists")
+    removed = blocks.pop(rule_index)
+    write_json(APPROVALS, data, 0o600)
+    return removed
+
+
+def revoke_ssh_block(alias):
+    data = load_ssh_policy()
+    blocks = data.get("blocks", {})
+    if alias not in blocks:
+        raise ValueError("SSH block no longer exists")
+    removed = blocks.pop(alias)
+    if not isinstance(removed, dict):
+        removed = {"alias": alias}
+    removed.setdefault("alias", alias)
+    write_ssh_policy(data)
+    return removed
+
+
+def remove_ssh_alias(alias):
+    data = load_ssh_policy()
+    aliases = data.get("aliases", {})
+    if alias not in aliases:
+        raise ValueError("SSH alias no longer exists")
+    removed = aliases.pop(alias)
+    if not isinstance(removed, dict):
+        removed = {"alias": alias}
+    removed.setdefault("alias", alias)
+    write_ssh_policy(data)
+    return removed
+
+
+def set_approval_ttl(rule_index, ttl):
+    data = load_approvals()
+    rules = data.get("rules", [])
+    if rule_index < 0 or rule_index >= len(rules):
+        raise ValueError("approval no longer exists")
+    rule = rules[rule_index]
+    if not isinstance(rule, dict):
+        raise ValueError("approval rule is malformed")
+    expires = expires_for_ttl(ttl)
+    if expires is None:
+        rule.pop("expires_at", None)
+    else:
+        rule["expires_at"] = expires.isoformat()
+    rule["ttl_updated_at"] = utc_now().isoformat()
+    write_json(APPROVALS, data, 0o600)
+    return rule
+
+
+def block_request(path, request):
+    if request.get("kind") in {"ssh", "ssh-lease"}:
+        added = block_ssh_request(request)
+        mark_request(path, request, "denied", "forever denied by host operator")
+        return added
+    rules = rules_for_request(request)
+    if not rules:
+        raise ValueError(f"{request.get('kind')} requests cannot be blocklisted by this operator")
+    reason = request.get("payload", {}).get("reason") or summarize(request)
+    added = add_blocks(rules, reason, request)
+    mark_request(path, request, "denied", "forever denied by host operator")
+    return added
+
+
+def block_ssh_request(request):
+    payload = request.get("payload", {})
+    alias = payload.get("alias")
+    if not alias:
+        raise ValueError("SSH request is missing alias")
+    policy = load_ssh_policy()
+    entry = dict(policy.get("aliases", {}).get(alias, {}))
+    entry["alias"] = alias
+    entry["blocked_at"] = utc_now().isoformat()
+    entry["reason"] = payload.get("reason") or summarize(request)
+    entry["source_request_id"] = request.get("id", "")
+    policy.setdefault("blocks", {})[alias] = entry
+    write_ssh_policy(policy)
+    return [entry]
+
+
+def block_ssh_alias(alias):
+    policy = load_ssh_policy()
+    aliases = policy.get("aliases", {})
+    entry = dict(aliases.pop(alias, {}))
+    if not entry:
+        raise ValueError("SSH alias no longer exists")
+    entry["alias"] = alias
+    entry["blocked_at"] = utc_now().isoformat()
+    entry["reason"] = "blocked by host operator"
+    policy.setdefault("blocks", {})[alias] = entry
+    write_ssh_policy(policy)
+    return entry
+
+
+def ssh_alias_blocked(alias):
+    return alias in ssh_blocks()
+
+
+def add_ssh_alias(stdscr):
+    alias = prompt_line(stdscr, "ssh alias: ")
+    if not alias:
+        raise ValueError("alias is required")
+    if any(char.isspace() for char in alias):
+        raise ValueError("alias cannot contain whitespace")
+    host = prompt_line(stdscr, "ssh host: ")
+    if not host:
+        raise ValueError("host is required")
+    user = prompt_line(stdscr, f"ssh user [{os.environ.get('USER', '')}]: ") or os.environ.get("USER", "")
+    port_text = prompt_line(stdscr, "ssh port [22]: ") or "22"
+    identity = prompt_line(stdscr, "identity file [optional]: ")
+    command = prompt_line(stdscr, "default remote command [optional]: ")
+    entry = {
+        "host": host,
+        "user": user,
+        "port": int(port_text),
+        "features": {
+            "agent_forwarding": False,
+            "x11_forwarding": False,
+            "port_forwarding": False,
+        },
+        "created_at": utc_now().isoformat(),
+    }
+    if identity:
+        entry["identity_file"] = identity
+    if command:
+        entry["command"] = command
+    policy = load_ssh_policy()
+    if alias in policy.get("blocks", {}):
+        raise ValueError("alias is blocklisted; remove it from blacklist first")
+    policy.setdefault("aliases", {})[alias] = entry
+    write_ssh_policy(policy)
+    return alias, entry
+
+
+def request_scope(request):
+    payload = request.get("payload", {})
+    return payload.get("scope") or payload.get("lease", {}).get("scope") or {}
+
+
+def approve_ssh_lease(request, ttl):
+    payload = request.get("payload", {})
+    alias = payload.get("alias")
+    scope = request_scope(request)
+    if not alias or not scope:
+        raise ValueError("SSH lease request is missing alias or process scope")
+    if ssh_alias_blocked(alias):
+        raise ValueError(f"SSH alias is blocklisted: {alias}")
+    if alias not in load_ssh_allowlist():
+        raise ValueError(f"unknown SSH alias: {alias}")
+    expires = expires_for_ttl(ttl)
+    lease_id = f"{utc_now().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    lease = {
+        "id": lease_id,
+        "alias": alias,
+        "created_at": utc_now().isoformat(),
+        "scope": {
+            "sid": scope.get("sid"),
+            "pgid": scope.get("pgid"),
+            "uid": scope.get("uid"),
+        },
+        "request_id": request.get("id"),
+        "features": {
+            "agent_forwarding": False,
+            "x11_forwarding": False,
+            "port_forwarding": False,
+        },
+    }
+    if expires is not None:
+        lease["expires_at"] = expires.isoformat()
+    write_json(LEASE_DIR / f"{lease_id}.json", lease, 0o644)
+
+
+def ssh_command_for_request(request):
+    payload = request.get("payload", {})
+    alias = payload.get("alias")
+    if not alias:
+        raise ValueError("SSH request is missing alias")
+    if ssh_alias_blocked(alias):
+        raise ValueError(f"SSH alias is blocklisted: {alias}")
+    aliases = load_ssh_allowlist()
+    if alias not in aliases:
+        raise ValueError(f"unknown SSH alias: {alias}")
+    entry = aliases[alias]
+    host = entry["host"]
+    user = entry.get("user", os.environ.get("USER", ""))
+    port = int(entry.get("port", 22))
+    identity = entry.get("identity_file")
+    command = payload.get("remote_command") or entry.get("command", "")
+    features = entry.get("features", {})
+    if features.get("agent_forwarding") or features.get("x11_forwarding") or features.get("port_forwarding"):
+        raise ValueError("forwarding features are intentionally not supported by this operator")
+    target = f"{user}@{host}" if user else host
+    ssh_cmd = [
+        "ssh",
+        "-p", str(port),
+        "-o", "ForwardAgent=no",
+        "-o", "ForwardX11=no",
+        "-o", "PermitLocalCommand=no",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ClearAllForwardings=yes",
+    ]
+    if identity:
+        ssh_cmd.extend(["-i", os.path.expanduser(identity)])
+    ssh_cmd.append(target)
+    if command:
+        ssh_cmd.append(command)
+    return alias, target, command, ssh_cmd
+
+
+def run_host_ssh(stdscr, request):
+    alias, target, command, ssh_cmd = ssh_command_for_request(request)
+    curses.def_prog_mode()
+    curses.endwin()
+    try:
+        print()
+        print("Opening approved host-side SSH session")
+        print(f"  alias: {alias}")
+        print(f"  target: {target}")
+        print(f"  command: {command or '<interactive>'}")
+        print(f"  exec: {shlex.join(ssh_cmd)}")
+        print()
+        status = subprocess.call(ssh_cmd)
+        print()
+        input(f"SSH exited with status {status}. Press Enter to return to jail-operator.")
+        return status
+    finally:
+        curses.reset_prog_mode()
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        stdscr.timeout(REFRESH_MS)
+
+
+def draw_text(win, y, x, text, attr=0):
+    height, width = win.getmaxyx()
+    if y < 0 or y >= height or x >= width:
+        return
+    win.addnstr(y, x, text, max(0, width - x - 1), attr)
+
+
+def detail_lines(request, ttl, path=None):
+    payload = request.get("payload", {})
+    lines = [
+        f"id: {request.get('id', '')}",
+        f"kind: {request.get('kind', '')}",
+        f"status: {request.get('status', 'pending')}",
+        f"created: {timestamp_label(request.get('created_at'))}",
+        f"cwd: {request.get('cwd', '')}",
+        f"ttl: {ttl}",
+    ]
+    if path:
+        lines.append(f"file: {path}")
+    lines.extend(["", "payload:"])
+    for line in json.dumps(payload, indent=2, sort_keys=True).splitlines():
+        lines.append(f"  {line}")
+    rules = rules_for_request(request)
+    if rules:
+        lines.extend(["", "approval rules:"])
+        for rule in rules:
+            lines.append(f"  {json.dumps(rule, sort_keys=True)}")
+    return lines
+
+
+def approval_detail_lines(rule):
+    lines = [
+        f"name: {rule.get('name', 'unnamed')}",
+        f"state: {'enabled' if rule.get('enabled', True) else 'disabled'}",
+        f"target: {approval_target(rule)}",
+        f"protocols: {','.join(rule.get('protocols') or [])}",
+        f"approved: {timestamp_label(rule.get('approved_at') or rule.get('created_at'))}",
+        f"ttl updated: {timestamp_label(rule.get('ttl_updated_at'))}",
+        f"ttl: {ttl_label(rule.get('expires_at'))}",
+        f"expires: {timestamp_label(rule.get('expires_at')) or 'forever'}",
+        f"reason: {rule.get('reason', '')}",
+        "",
+        "rule:",
+    ]
+    for line in json.dumps(rule, indent=2, sort_keys=True).splitlines():
+        lines.append(f"  {line}")
+    return lines
+
+
+def block_detail_lines(rule):
+    lines = [
+        f"name: {rule.get('name', 'unnamed')}",
+        f"state: {'enabled' if rule.get('enabled', True) else 'disabled'}",
+        f"target: {approval_target(rule)}",
+        f"protocols: {','.join(rule.get('protocols') or [])}",
+        f"blocked: {timestamp_label(rule.get('blocked_at') or rule.get('created_at'))}",
+        f"source request: {rule.get('source_request_id', '')}",
+        f"reason: {rule.get('reason', '')}",
+        "",
+        "block:",
+    ]
+    for line in json.dumps(rule, indent=2, sort_keys=True).splitlines():
+        lines.append(f"  {line}")
+    return lines
+
+
+def ssh_block_detail_lines(entry):
+    lines = [
+        f"alias: {entry.get('alias', '')}",
+        f"host: {entry.get('host', '')}",
+        f"user: {entry.get('user', '')}",
+        f"port: {entry.get('port', '')}",
+        f"identity: {entry.get('identity_file', '')}",
+        f"blocked: {timestamp_label(entry.get('blocked_at'))}",
+        f"source request: {entry.get('source_request_id', '')}",
+        f"reason: {entry.get('reason', '')}",
+        "",
+        "block:",
+    ]
+    for line in json.dumps(entry, indent=2, sort_keys=True).splitlines():
+        lines.append(f"  {line}")
+    return lines
+
+
+def ssh_alias_detail_lines(alias, entry):
+    lines = [
+        f"alias: {alias}",
+        f"host: {entry.get('host', '')}",
+        f"user: {entry.get('user', '')}",
+        f"port: {entry.get('port', 22)}",
+        f"identity: {entry.get('identity_file', '')}",
+        f"default command: {entry.get('command', '')}",
+        f"created: {timestamp_label(entry.get('created_at'))}",
+        f"updated: {timestamp_label(entry.get('updated_at'))}",
+        "",
+        "alias:",
+    ]
+    for line in json.dumps(entry, indent=2, sort_keys=True).splitlines():
+        lines.append(f"  {line}")
+    return lines
+
+
+def approval_target(rule):
+    host = rule.get("host") or rule.get("host_suffix") or rule.get("host_glob") or "?"
+    return f"{host}:{rule.get('port', 443)}"
+
+
+def ssh_alias_target(entry):
+    host = entry.get("host", "?")
+    user = entry.get("user", "")
+    port = entry.get("port", 22)
+    target = f"{user}@{host}" if user else host
+    return f"{target}:{port}"
+
+
+def prompt_line(stdscr, prompt):
+    curses.echo()
+    height, width = stdscr.getmaxyx()
+    draw_text(stdscr, height - 1, 0, " " * (width - 1))
+    draw_text(stdscr, height - 1, 0, prompt)
+    stdscr.refresh()
+    value = stdscr.getstr(height - 1, min(len(prompt), width - 2), 240).decode("utf-8").strip()
+    curses.noecho()
+    return value
+
+
+def approve_request(path, request, ttl, stdscr=None):
+    kind = request.get("kind")
+    if kind == "ssh-lease" or (kind == "ssh" and request.get("payload", {}).get("lease", {}).get("requested")):
+        approve_ssh_lease(request, ttl)
+        mark_request(path, request, "approved", f"approved SSH lease for {ttl}")
+        return
+    if kind == "ssh":
+        if stdscr is None:
+            raise ValueError("SSH approval requires an interactive operator terminal")
+        ssh_command_for_request(request)
+        mark_request(path, request, "approved", "approved and opened host-side SSH session")
+        run_host_ssh(stdscr, request)
+        return
+    rules = rules_for_request(request)
+    if not rules:
+        raise ValueError(f"{kind} requests cannot be auto-approved by this operator")
+    reason = request.get("payload", {}).get("reason") or summarize(request)
+    add_rules(rules, ttl, reason)
+    mark_request(path, request, "approved", f"approved egress for {ttl}")
+
+
+def page_size(height):
+    return max(1, height - 10)
+
+
+def move_page(index, count, height, direction):
+    if not count:
+        return 0
+    delta = page_size(height) * direction
+    return min(max(index + delta, 0), count - 1)
+
+
+def draw_wrapped_lines(stdscr, y, width, lines, max_y):
+    for line in lines:
+        for wrapped in textwrap.wrap(line, width=max(20, width - 2)) or [""]:
+            draw_text(stdscr, y, 0, wrapped)
+            y += 1
+            if y >= max_y:
+                return y
+    return y
+
+
+def help_text_for_view(view):
+    common = "tab view  s sort  arrows move  pg/space page  enter details"
+    if view == "pending":
+        return f"{common}  +/- ttl  a approve  d deny  x forever deny  q quit"
+    if view == "approvals":
+        return f"{common}  +/- ttl  t set ttl  r revoke  q quit"
+    if view == "blacklist":
+        return f"{common}  r remove block  q quit"
+    if view == "ssh":
+        return f"{common}  n add alias  r remove alias  x block alias  q quit"
+    return f"{common}  q quit"
+
+
+def app(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(REFRESH_MS)
+    index = 0
+    approval_index = 0
+    block_index = 0
+    ssh_index = 0
+    ttl_index = 1
+    view = "pending"
+    sort_index = 0
+    show_detail = True
+    message = ""
+    while True:
+        removed = prune_expired_approvals()
+        sort_mode = SORT_CHOICES[sort_index]
+        requests = request_files(sort_mode)
+        approvals = active_approvals(sort_mode)
+        blocks = active_blacklist(sort_mode)
+        ssh_aliases = active_ssh_aliases(sort_mode)
+        if index >= len(requests):
+            index = max(0, len(requests) - 1)
+        if approval_index >= len(approvals):
+            approval_index = max(0, len(approvals) - 1)
+        if block_index >= len(blocks):
+            block_index = max(0, len(blocks) - 1)
+        if ssh_index >= len(ssh_aliases):
+            ssh_index = max(0, len(ssh_aliases) - 1)
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        if view == "pending":
+            active_rows = requests
+            active_index = index
+        elif view == "approvals":
+            active_rows = approvals
+            active_index = approval_index
+        elif view == "blacklist":
+            active_rows = blocks
+            active_index = block_index
+        else:
+            active_rows = ssh_aliases
+            active_index = ssh_index
+        help_text = help_text_for_view(view)
+        draw_text(stdscr, 0, 0, "Hardened Jail Operator", curses.A_BOLD)
+        draw_text(stdscr, 1, 0, f"home: {BASE}")
+        draw_text(stdscr, 2, 0, f"view: {view}   pending: {len(requests)}   approvals: {len(approvals)}   blacklist: {len(blocks)}   ssh: {len(ssh_aliases)}   ttl: {TTL_CHOICES[ttl_index]}   sort: {sort_mode}")
+        status = message or (f"removed {removed} expired approval(s)" if removed else help_text)
+        draw_text(stdscr, 3, 0, status[: width - 1])
+        list_height = page_size(height)
+        start = max(0, min(active_index, max(0, len(active_rows) - list_height)))
+        for row, item in enumerate(active_rows[start:start + list_height]):
+            item_index = start + row
+            attr = curses.A_REVERSE if item_index == active_index else 0
+            if view == "pending":
+                _path, request = item
+                line = f"{item_index + 1:2d} {timestamp_label(request.get('created_at')):23s}  {summarize(request)}"
+            elif view == "blacklist":
+                kind, _rule_index, entry = item
+                target = ssh_alias_target(entry) if kind == "ssh" else approval_target(entry)
+                line = f"{item_index + 1:2d} {kind:7s}     {target:36s}  {entry.get('name') or entry.get('alias', '')}"
+            elif view == "ssh":
+                alias, entry = item
+                line = f"{item_index + 1:2d} {alias:18s} {ssh_alias_target(entry):40s} {entry.get('identity_file', '')}"
+            else:
+                _rule_index, rule = item
+                line = f"{item_index + 1:2d} {ttl_label(rule.get('expires_at')):10s}  {approval_target(rule):36s}  {rule.get('name', 'unnamed')}"
+            draw_text(stdscr, 5 + row, 0, line, attr)
+        if active_rows and show_detail:
+            y = 6 + list_height
+            if view == "pending":
+                path, selected = active_rows[active_index]
+                lines = detail_lines(selected, TTL_CHOICES[ttl_index], path)
+            elif view == "blacklist":
+                kind, _, selected = active_rows[active_index]
+                lines = ssh_block_detail_lines(selected) if kind == "ssh" else block_detail_lines(selected)
+            elif view == "ssh":
+                alias, selected = active_rows[active_index]
+                lines = ssh_alias_detail_lines(alias, selected)
+            else:
+                _, selected = active_rows[active_index]
+                lines = approval_detail_lines(selected)
+            draw_wrapped_lines(stdscr, y, width, lines[: max(0, height - y - 1)], height - 1)
+        elif not active_rows:
+            empty = {
+                "pending": "No pending requests.",
+                "approvals": "No active approvals.",
+                "blacklist": "No blocklisted targets.",
+                "ssh": "No SSH aliases.",
+            }[view]
+            draw_text(stdscr, 6, 0, empty)
+        else:
+            draw_text(stdscr, 6 + list_height, 0, "Details hidden. Press Enter to show them.")
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == -1:
+            message = ""
+            continue
+        message = ""
+        if key in (ord("q"), 27):
+            break
+        if key in (ord("\t"),):
+            view = VIEW_CHOICES[(VIEW_CHOICES.index(view) + 1) % len(VIEW_CHOICES)]
+        elif key == ord("s"):
+            sort_index = (sort_index + 1) % len(SORT_CHOICES)
+        elif key in (curses.KEY_DOWN, ord("j")) and active_rows:
+            if view == "pending":
+                index = min(index + 1, len(requests) - 1)
+            elif view == "approvals":
+                approval_index = min(approval_index + 1, len(approvals) - 1)
+            elif view == "blacklist":
+                block_index = min(block_index + 1, len(blocks) - 1)
+            else:
+                ssh_index = min(ssh_index + 1, len(ssh_aliases) - 1)
+        elif key in (curses.KEY_UP, ord("k")) and active_rows:
+            if view == "pending":
+                index = max(index - 1, 0)
+            elif view == "approvals":
+                approval_index = max(approval_index - 1, 0)
+            elif view == "blacklist":
+                block_index = max(block_index - 1, 0)
+            else:
+                ssh_index = max(ssh_index - 1, 0)
+        elif key in (curses.KEY_NPAGE, ord(" ")) and active_rows:
+            if view == "pending":
+                index = move_page(index, len(requests), height, 1)
+            elif view == "approvals":
+                approval_index = move_page(approval_index, len(approvals), height, 1)
+            elif view == "blacklist":
+                block_index = move_page(block_index, len(blocks), height, 1)
+            else:
+                ssh_index = move_page(ssh_index, len(ssh_aliases), height, 1)
+        elif key in (curses.KEY_PPAGE, ord("b"), ord("B")) and active_rows:
+            if view == "pending":
+                index = move_page(index, len(requests), height, -1)
+            elif view == "approvals":
+                approval_index = move_page(approval_index, len(approvals), height, -1)
+            elif view == "blacklist":
+                block_index = move_page(block_index, len(blocks), height, -1)
+            else:
+                ssh_index = move_page(ssh_index, len(ssh_aliases), height, -1)
+        elif key in (ord("+"), ord("=")):
+            ttl_index = min(ttl_index + 1, len(TTL_CHOICES) - 1)
+        elif key in (ord("-"), ord("_")):
+            ttl_index = max(ttl_index - 1, 0)
+        elif key == ord("r") and view == "approvals" and approvals:
+            rule_index, rule = approvals[approval_index]
+            try:
+                removed_rule = revoke_approval(rule_index)
+                message = f"revoked {removed_rule.get('name') or approval_target(rule)}"
+            except Exception as exc:
+                message = f"revoke failed: {exc}"
+        elif key == ord("r") and view == "blacklist" and blocks:
+            kind, rule_index, rule = blocks[block_index]
+            try:
+                if kind == "ssh":
+                    removed_rule = revoke_ssh_block(rule_index)
+                    message = f"removed SSH block {removed_rule.get('alias', rule_index)}"
+                else:
+                    removed_rule = revoke_block(rule_index)
+                    message = f"removed block {removed_rule.get('name') or approval_target(rule)}"
+            except Exception as exc:
+                message = f"block remove failed: {exc}"
+        elif key == ord("r") and view == "ssh" and ssh_aliases:
+            alias, _entry = ssh_aliases[ssh_index]
+            try:
+                remove_ssh_alias(alias)
+                message = f"removed SSH alias {alias}"
+            except Exception as exc:
+                message = f"ssh alias remove failed: {exc}"
+        elif key == ord("n") and view == "ssh":
+            try:
+                alias, _entry = add_ssh_alias(stdscr)
+                message = f"added SSH alias {alias}"
+            except Exception as exc:
+                message = f"ssh alias add failed: {exc}"
+        elif key == ord("a") and view == "pending" and requests:
+            path, request = requests[index]
+            try:
+                approve_request(path, request, TTL_CHOICES[ttl_index], stdscr)
+                message = f"approved {summarize(request)}"
+            except Exception as exc:
+                message = f"approve failed: {exc}"
+        elif key == ord("d") and view == "pending" and requests:
+            path, request = requests[index]
+            reason = prompt_line(stdscr, "deny reason: ") or "denied by host operator"
+            mark_request(path, request, "denied", reason)
+            message = f"denied {summarize(request)}"
+        elif key == ord("x") and view == "pending" and requests:
+            path, request = requests[index]
+            try:
+                added = block_request(path, request)
+                message = f"forever denied {len(added)} target(s)"
+            except Exception as exc:
+                message = f"forever deny failed: {exc}"
+        elif key == ord("x") and view == "ssh" and ssh_aliases:
+            alias, _entry = ssh_aliases[ssh_index]
+            try:
+                block_ssh_alias(alias)
+                message = f"blocked SSH alias {alias}"
+            except Exception as exc:
+                message = f"ssh block failed: {exc}"
+        elif key == ord("t") and view == "approvals" and approvals:
+            rule_index, _rule = approvals[approval_index]
+            ttl = TTL_CHOICES[ttl_index]
+            try:
+                updated_rule = set_approval_ttl(rule_index, ttl)
+                message = f"set {updated_rule.get('name') or approval_target(updated_rule)} ttl to {ttl}"
+            except Exception as exc:
+                message = f"ttl update failed: {exc}"
+        elif key in (curses.KEY_ENTER, 10, 13) and active_rows:
+            show_detail = not show_detail
+
+
+def main():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise SystemExit("jail-operator requires an interactive terminal")
+    POLICY_DIR.mkdir(parents=True, exist_ok=True)
+    REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    LEASE_DIR.mkdir(parents=True, exist_ok=True)
+    curses.wrapper(app)
+
+
+if __name__ == "__main__":
+    main()

@@ -42,10 +42,16 @@ else
   check_ok "SSH private keys absent from home"
 fi
 
-if [[ -e "$HOME/.claude/.credentials.json" || -e "$HOME/.codex/auth.json" ]]; then
-  check_fail "agent credentials are mounted in worker home"
+if [[ -d "$HOME/.claude" && -d "$HOME/.codex" && -d "$HOME/.agents" ]]; then
+  check_ok "agent state directories are available inside the jail"
 else
-  check_ok "Claude/Codex credentials absent from worker home"
+  check_fail "agent state directories are missing"
+fi
+
+if [[ -e /policy/approvals.json || -e "$HOME/.devcontainer-jail/policy/approvals.json" ]]; then
+  check_fail "host approval policy is visible in the worker"
+else
+  check_ok "host approval policy is not mounted in the worker"
 fi
 
 if awk '/NoNewPrivs:/ { exit ($2 == 1 ? 0 : 1) }' /proc/self/status; then

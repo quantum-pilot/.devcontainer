@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${ENABLE_HOST_CHROME:-false}" != "true" ]]; then
-  echo "Host Chrome bridge disabled. Set ENABLE_HOST_CHROME=true to start it."
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+config_file="${HOST_CHROME_CONFIG:-$script_dir/host/chrome-bridge.env}"
+
+if [[ -f "$config_file" ]]; then
+  # shellcheck source=/dev/null
+  source "$config_file"
+fi
+
+if [[ "${HOST_CHROME_ENABLED:-${ENABLE_HOST_CHROME:-false}}" != "true" ]]; then
+  echo "Host Chrome bridge disabled in ${config_file}."
   exit 0
 fi
 

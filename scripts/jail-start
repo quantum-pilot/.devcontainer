@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p \
+  "$HOME/.cache" \
+  "$HOME/.npm" \
+  "$HOME/.local/bin" \
+  "$HOME/.local/share/pnpm/bin" \
+  "$HOME/.local/share/headroom"
+
+if command -v tmux >/dev/null 2>&1 && command -v headroom >/dev/null 2>&1; then
+  if ! tmux has-session -t headroom 2>/dev/null; then
+    tmux new-session -d -s headroom -n proxy /usr/local/bin/headroom-proxy
+  fi
+fi
+
+exec sleep infinity

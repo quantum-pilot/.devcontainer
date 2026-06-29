@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import sys
+import time
 import uuid
 
 
@@ -24,14 +26,37 @@ def write_request(kind, payload):
     request = {
         "id": request_id,
         "kind": kind,
+        "status": "pending",
         "created_at": utc_now().isoformat(),
         "cwd": os.getcwd(),
         "payload": payload,
     }
     path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"request written: {path}")
-    print("approve from the host with the matching host/jail-* broker command")
-    return 0
+    try:
+        path.chmod(0o666)
+    except OSError:
+        pass
+    print(f"request written: {path}", flush=True)
+    print("approve from the host with .devcontainer/host/jail-operator", flush=True)
+    return path
+
+
+def wait_for_resolution(path, timeout):
+    deadline = time.time() + timeout if timeout else None
+    while True:
+        request = read_json(path) or {}
+        status = request.get("status", "pending")
+        if status == "approved":
+            print(f"request approved: {path.name}", flush=True)
+            return 0
+        if status == "denied":
+            reason = request.get("decision_reason", "")
+            print(f"request denied: {reason}".rstrip(), file=sys.stderr)
+            return 1
+        if deadline and time.time() >= deadline:
+            print(f"timed out waiting for approval: {path}", file=sys.stderr)
+            return 124
+        time.sleep(1)
 
 
 def process_tree():
@@ -126,25 +151,28 @@ def lockfiles(root):
 
 
 def cmd_egress(args):
-    return write_request("egress", {
+    path = write_request("egress", {
         "host": args.host,
         "port": args.port,
         "protocols": args.protocol,
         "ttl": args.ttl,
         "reason": args.reason,
     })
+    if args.wait:
+        return wait_for_resolution(path, args.wait_timeout)
+    return 0
 
 
 def cmd_ssh(args):
     lease_path, lease = live_ssh_lease(args.alias)
     if lease:
         print(f"ssh lease active: {lease_path}")
-        print("open the matching host-side SSH broker session; no new approval request was created")
+        print("open or reuse the matching host-side session from .devcontainer/host/jail-operator; no new approval request was created")
         if args.command:
             print(f"requested remote command: {args.command}")
         return 0
 
-    return write_request("ssh", {
+    path = write_request("ssh", {
         "alias": args.alias,
         "remote_command": args.command,
         "lease": {
@@ -158,19 +186,33 @@ def cmd_ssh(args):
             "port_forwarding": False,
         },
     })
+    if args.wait:
+        return wait_for_resolution(path, args.wait_timeout)
+    return 0
 
 
 def cmd_install(args):
-    return write_request("install", {
+    path = write_request("install", {
         "manager": args.manager,
         "arguments": args.arguments,
         "project": os.getcwd(),
         "lockfiles": lockfiles(os.getcwd()),
     })
+    if args.wait or args.run:
+        status = wait_for_resolution(path, args.wait_timeout)
+        if status != 0:
+            return status
+    if args.run:
+        command = [args.manager, *args.arguments]
+        if not shutil.which(command[0]):
+            print(f"install manager not found: {command[0]}", file=sys.stderr)
+            return 127
+        os.execvp(command[0], command)
+    return 0
 
 
 def cmd_ssh_lease(args):
-    return write_request("ssh-lease", {
+    path = write_request("ssh-lease", {
         "alias": args.alias,
         "ttl": args.ttl,
         "scope": session_scope(),
@@ -180,6 +222,29 @@ def cmd_ssh_lease(args):
             "port_forwarding": False,
         },
     })
+    if args.wait:
+        return wait_for_resolution(path, args.wait_timeout)
+    return 0
+
+
+def cmd_agent_login(args):
+    commands = {
+        "claude": ["claude"],
+        "codex": ["codex", "login"],
+    }
+    path = write_request("agent-login", {
+        "agent": args.agent,
+        "ttl": args.ttl,
+        "reason": args.reason or f"{args.agent} login/runtime bootstrap",
+    })
+    if not args.no_wait:
+        status = wait_for_resolution(path, args.wait_timeout)
+        if status != 0:
+            return status
+    if args.no_exec:
+        return 0
+    command = commands[args.agent]
+    os.execvp(command[0], command)
 
 
 def main():
@@ -192,6 +257,8 @@ def main():
     egress.add_argument("--protocol", action="append", choices=["connect", "http"], default=["connect"])
     egress.add_argument("--ttl", default="10m")
     egress.add_argument("--reason", default="")
+    egress.add_argument("--wait", action="store_true", help="wait for host approval or denial")
+    egress.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
     egress.set_defaults(func=cmd_egress)
 
     ssh = sub.add_parser("ssh", help="request an approved host-side SSH session")
@@ -199,17 +266,33 @@ def main():
     ssh.add_argument("--command", default="")
     ssh.add_argument("--lease", action="store_true", help="request a reusable lease for this process session")
     ssh.add_argument("--ttl", default="30m")
+    ssh.add_argument("--wait", action="store_true", help="wait for host approval or denial")
+    ssh.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
     ssh.set_defaults(func=cmd_ssh)
 
     lease = sub.add_parser("ssh-lease", help="request a reusable SSH lease for this process session")
     lease.add_argument("alias")
     lease.add_argument("--ttl", default="30m")
+    lease.add_argument("--wait", action="store_true", help="wait for host approval or denial")
+    lease.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
     lease.set_defaults(func=cmd_ssh_lease)
 
     install = sub.add_parser("install", help="request a brokered package/tool install")
     install.add_argument("manager", choices=["npm", "pnpm", "yarn", "pip", "uv", "cargo", "go", "mise"])
     install.add_argument("arguments", nargs=argparse.REMAINDER)
+    install.add_argument("--wait", action="store_true", help="wait for host approval or denial")
+    install.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
+    install.add_argument("--run", action="store_true", help="run the install command after approval")
     install.set_defaults(func=cmd_install)
+
+    agent = sub.add_parser("agent-login", help="request network access and run an agent login command")
+    agent.add_argument("agent", choices=["claude", "codex"])
+    agent.add_argument("--ttl", default="30m")
+    agent.add_argument("--reason", default="")
+    agent.add_argument("--no-wait", action="store_true", help="do not wait for approval before launching the CLI")
+    agent.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
+    agent.add_argument("--no-exec", action="store_true", help="only create the request")
+    agent.set_defaults(func=cmd_agent_login)
 
     args = parser.parse_args()
     return args.func(args)
