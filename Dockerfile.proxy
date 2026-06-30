@@ -2,7 +2,9 @@ FROM python:3.12-alpine
 
 COPY scripts/egress-proxy.py /usr/local/bin/egress-proxy
 COPY scripts/tcp-forwarder.py /usr/local/bin/tcp-forwarder
-RUN chmod 0755 /usr/local/bin/egress-proxy /usr/local/bin/tcp-forwarder
+COPY scripts/proxy-entrypoint /usr/local/bin/proxy-entrypoint
+RUN chmod 0755 /usr/local/bin/egress-proxy /usr/local/bin/tcp-forwarder /usr/local/bin/proxy-entrypoint
 
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/egress-proxy"]
+EXPOSE 8822
+ENTRYPOINT ["/usr/local/bin/proxy-entrypoint"]

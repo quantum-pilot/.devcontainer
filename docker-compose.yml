@@ -3,15 +3,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_PYTHON: ${ENABLE_PYTHON:-false}
-        ENABLE_GO: ${ENABLE_GO:-false}
-        ENABLE_RUST: ${ENABLE_RUST:-false}
-        ENABLE_PLAYWRIGHT: ${ENABLE_PLAYWRIGHT:-false}
-        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
-        GO_VERSION: ${GO_VERSION:-1.26.4}
-        GO_ARCH: ${GO_ARCH:-amd64}
-        RUST_VERSION: ${RUST_VERSION:-stable}
     init: true
     tty: true
     command: jail-start
@@ -28,16 +19,22 @@ services:
       - /home/node/.cache:rw,nosuid,nodev,uid=1000,gid=1000,size=2g
       - /home/node/.npm:rw,nosuid,nodev,uid=1000,gid=1000,size=1g
     environment:
-      HTTP_PROXY: http://egress-proxy:8080
-      HTTPS_PROXY: http://egress-proxy:8080
-      ALL_PROXY: http://egress-proxy:8080
-      NO_PROXY: localhost,127.0.0.1,::1,egress-proxy,ssh-broker-proxy
-      npm_config_proxy: http://egress-proxy:8080
-      npm_config_https_proxy: http://egress-proxy:8080
+      HTTP_PROXY: http://proxy:8080
+      HTTPS_PROXY: http://proxy:8080
+      ALL_PROXY: http://proxy:8080
+      NO_PROXY: localhost,127.0.0.1,::1,proxy
+      npm_config_proxy: http://proxy:8080
+      npm_config_https_proxy: http://proxy:8080
       GIT_SSH: /usr/local/bin/ssh
+      XDG_CONFIG_HOME: /home/node/.local/config
+      GNUPGHOME: /home/node/.local/share/gnupg
+      MISE_DATA_DIR: /home/node/.local/share/mise
+      MISE_CONFIG_DIR: /home/node/.local/share/mise/config
+      MISE_CACHE_DIR: /home/node/.local/cache/mise
+      MISE_STATE_DIR: /home/node/.local/state/mise
       JAIL_HEADROOM_TMUX_SESSION: headroom
       JAIL_MANAGED_TMUX_SESSIONS: headroom
-      JAIL_SSH_BROKER_HOST: ssh-broker-proxy
+      JAIL_SSH_BROKER_HOST: proxy
       JAIL_SSH_BROKER_PORT: "8822"
       JAIL_SSH_BROKER_TOKEN_FILE: /jail-ssh-broker-token
     volumes:
@@ -55,11 +52,12 @@ services:
       - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/state/ssh-broker-token:/jail-ssh-broker-token:ro
     networks:
       - jail_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      - egress-proxy
-      - ssh-broker-proxy
+      - proxy
 
-  egress-proxy:
+  proxy:
     build:
       context: .
       dockerfile: Dockerfile.proxy
@@ -79,32 +77,14 @@ services:
       EGRESS_PORT: "8080"
       EGRESS_WAIT_FOR_APPROVAL: "true"
       EGRESS_APPROVAL_WAIT_TIMEOUT: "0"
+      TCP_FORWARD_BIND: 0.0.0.0
+      TCP_FORWARD_PORT: "8822"
+      TCP_FORWARD_PORTS: "${JAIL_BRIDGE_PORTS:-}"
+      TCP_FORWARD_TARGET_HOST: host.docker.internal
     volumes:
       - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/policy:/policy:ro
       - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/state:/state
       - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/requests:/jail-requests
-    networks:
-      - jail_net
-      - internet
-
-  ssh-broker-proxy:
-    build:
-      context: .
-      dockerfile: Dockerfile.proxy
-    init: true
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=16m
-    entrypoint: ["/usr/local/bin/tcp-forwarder"]
-    environment:
-      TCP_FORWARD_BIND: 0.0.0.0
-      TCP_FORWARD_PORT: "8822"
-      TCP_FORWARD_TARGET_HOST: host.docker.internal
-      TCP_FORWARD_TARGET_PORT: "8822"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

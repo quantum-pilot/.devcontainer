@@ -71,6 +71,10 @@ Proxy-aware network requests are default-deny. Unknown HTTP/HTTPS targets create
 or update one pending request per target. If approved before the client times
 out, the original request continues.
 
+Host raw-TCP services configured in `customizations.jail.bridgePorts` are
+reachable at `proxy:<port>`. For example, Postgres on the host at `5432` should
+use `proxy:5432` from inside the worker.
+
 For package-manager work, run the install through `jailctl`:
 
 ```bash
@@ -80,25 +84,18 @@ jailctl install --run npm ci
 jailctl install --run uv pip install -r requirements.txt
 ```
 
-`pnpm`, `uv`/`uvx`, Python venv support, Claude Code, Codex CLI, Graphify, GSD
-Core, Headroom, and Ponytail are installed in the worker image.
+`pnpm`, `uv`/`uvx`, Claude Code, Codex CLI, Graphify, GSD Core, Headroom, and
+Ponytail are installed in the worker image.
 
-Node/JavaScript tooling is enabled by default. `pnpm` and `uv` are the preferred
-package managers. Python, Go, Rust, and Playwright can be preinstalled at build
-time by editing `customizations.jail.buildArgs` in `.devcontainer/devcontainer.json`
-and rebuilding the devcontainer:
+Node/JavaScript tooling is enabled by default. `pnpm`, `uv`, and `mise` are the
+preferred package and toolchain managers.
 
-```json
-"buildArgs": {
-  "ENABLE_PYTHON": "true",
-  "ENABLE_GO": "true",
-  "ENABLE_RUST": "true"
-}
-```
+Install Python with `uv` or `mise`, and Go/Rust with `mise`, on demand inside
+the worker. The alias `m` is available for `mise`. User and per-repo toolchain
+state lives under persisted `/home/node/.local` paths.
 
-Without those args, install them on demand inside the worker using `uv`, `go`
-tarballs, or `rustup`; user-installed tools live under the persisted
-`/home/node/.local` volume.
+For shell customizations, edit `~/.zshrc.local`; it is persisted under
+`/home/node/.local/config/shell/zshrc` and sourced on startup.
 
 ## Agent Login
 
@@ -114,12 +111,8 @@ agent config directories.
 
 ## Headroom
 
-Headroom starts automatically in a detached worker tmux session named
-by `JAIL_HEADROOM_TMUX_SESSION`:
-
-```bash
-headroom-attach
-```
+Headroom starts automatically in a detached worker tmux session named by
+`JAIL_HEADROOM_TMUX_SESSION`.
 
 ## tmux Layouts
 
@@ -179,4 +172,10 @@ By default it starts on macOS during devcontainer initialization when `open`,
 
 ```text
 $HOME/.chrome-remote-test
+```
+
+Agents can connect to the host browser's CDP endpoint at:
+
+```text
+http://host.docker.internal:9222
 ```

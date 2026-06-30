@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+set -eu
+
+tcp-forwarder &
+forwarder_pid="$!"
+
+trap 'kill "$forwarder_pid" 2>/dev/null || true' INT TERM EXIT
+
+exec egress-proxy

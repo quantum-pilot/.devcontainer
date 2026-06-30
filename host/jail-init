@@ -2,6 +2,8 @@
 set -euo pipefail
 
 base="${DEVCONTAINER_JAIL_HOME:-$HOME/.devcontainer-jail}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+default_hosts_file="${JAIL_DEFAULT_EGRESS_HOSTS_FILE:-$script_dir/default-egress-hosts.txt}"
 mkdir -p "$base/policy" "$base/policy/ssh-leases" "$base/state" "$base/requests"
 token_file="$base/state/ssh-broker-token"
 
@@ -31,15 +33,15 @@ if [[ ! -f "$base/policy/ssh-allowlist.json" ]]; then
 JSON
 fi
 
-seed_marker="$base/policy/.default-agent-approvals-seeded"
-if [[ ! -f "$seed_marker" ]]; then
-  APPROVALS_FILE="$base/policy/approvals.json" python3 - <<'PY'
+if [[ -f "$default_hosts_file" ]]; then
+  APPROVALS_FILE="$base/policy/approvals.json" DEFAULT_EGRESS_HOSTS_FILE="$default_hosts_file" python3 - <<'PY'
 import datetime as dt
 import json
 import os
 from pathlib import Path
 
 path = Path(os.environ["APPROVALS_FILE"])
+hosts_path = Path(os.environ["DEFAULT_EGRESS_HOSTS_FILE"])
 try:
     data = json.loads(path.read_text(encoding="utf-8"))
 except (FileNotFoundError, json.JSONDecodeError):
@@ -48,41 +50,44 @@ except (FileNotFoundError, json.JSONDecodeError):
 rules = data.setdefault("rules", [])
 data.setdefault("blocks", [])
 now = dt.datetime.now(dt.timezone.utc).isoformat()
-defaults = [
-    "platform.claude.com",
-    "api.anthropic.com",
-    "chatgpt.com",
-    "auth.openai.com",
-    "api.openai.com",
-]
+defaults = []
+for line in hosts_path.read_text(encoding="utf-8").splitlines():
+    parts = line.split("#", 1)[0].split()
+    if not parts:
+        continue
+    target = parts[0]
+    host, sep, port = target.rpartition(":")
+    if not sep or not port.isdigit():
+        host, port = target, 443
+    protocols = parts[1:] or ["connect"]
+    defaults.append((host, int(port), protocols))
 
-def same_rule(rule, host):
+def same_rule(rule, host, port, protocols):
     return (
         isinstance(rule, dict)
         and rule.get("host") == host
-        and int(rule.get("port") or 443) == 443
-        and set(rule.get("protocols") or []) == {"connect"}
+        and int(rule.get("port") or 443) == port
+        and set(rule.get("protocols") or []) == set(protocols)
     )
 
-for host in defaults:
-    if any(same_rule(rule, host) for rule in rules):
+for host, port, protocols in defaults:
+    if any(same_rule(rule, host, port, protocols) for rule in rules):
         continue
     rules.append({
-        "name": f"{host}:443",
+        "name": f"{host}:{port}",
         "host": host,
-        "port": 443,
-        "protocols": ["connect"],
+        "port": port,
+        "protocols": protocols,
         "enabled": True,
         "created_at": now,
         "approved_at": now,
-        "reason": "default agent/headroom endpoint",
+        "reason": "default packaged endpoint",
     })
 
 tmp = path.with_suffix(path.suffix + ".tmp")
 tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 tmp.replace(path)
 PY
-  touch "$seed_marker"
 fi
 
 chmod 700 "$base" "$base/policy" "$base/state"

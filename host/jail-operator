@@ -33,19 +33,31 @@ BROKER_BIND = os.environ.get("JAIL_SSH_BROKER_BIND", "0.0.0.0")
 BROKER_PORT = int(os.environ.get("JAIL_SSH_BROKER_PORT", "8822"))
 TTL_CHOICES = ["5m", "10m", "30m", "1h", "4h", "forever"]
 REFRESH_MS = 1000
+TIMESTAMP_WIDTH = 20
 VIEW_CHOICES = ["pending", "leases", "sessions", "approvals", "blacklist"]
 AREA_VIEWS = {
     "egress": ["pending", "approvals", "blacklist"],
     "ssh": ["pending", "leases", "sessions", "blacklist"],
 }
 VIEW_COLOR_PAIR_BASE = 20
+AGE_COLOR_PAIR_BASE = 30
 VIEW_COLOR_SPECS = {
     "pending": (curses.COLOR_WHITE, curses.COLOR_BLUE),
-    "leases": (curses.COLOR_BLACK, curses.COLOR_GREEN),
+    "leases": (curses.COLOR_WHITE, curses.COLOR_GREEN),
     "sessions": (curses.COLOR_WHITE, curses.COLOR_MAGENTA),
-    "approvals": (curses.COLOR_BLACK, curses.COLOR_GREEN),
+    "approvals": (curses.COLOR_WHITE, curses.COLOR_GREEN),
     "blacklist": (curses.COLOR_WHITE, curses.COLOR_RED),
 }
+AGE_COLOR_SPECS_256 = [
+    (60, curses.COLOR_BLACK, 34),
+    (300, curses.COLOR_WHITE, 28),
+    (900, curses.COLOR_WHITE, 22),
+]
+AGE_COLOR_SPECS_FALLBACK = [
+    (60, curses.COLOR_BLACK, curses.COLOR_GREEN),
+    (300, curses.COLOR_WHITE, curses.COLOR_GREEN),
+    (900, curses.COLOR_WHITE, curses.COLOR_GREEN),
+]
 BROKER_STATUS = "ssh broker: starting"
 SSH_SESSIONS = {}
 SSH_SESSIONS_LOCK = threading.Lock()
@@ -162,7 +174,11 @@ def timestamp_label(value):
     parsed = parse_time(value or "")
     if not parsed:
         return ""
-    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def current_minute_label():
+    return utc_now().strftime("%Y-%m-%d %H:%MZ")
 
 
 def read_json(path, default=None):
@@ -495,19 +511,62 @@ def load_approvals():
 
 def prune_expired_approvals():
     data = load_approvals()
+    removed = compact_approval_rules(data)
+    if removed:
+        write_json(APPROVALS, data, 0o600)
+    return removed
+
+
+def compact_approval_rules(data):
     now = utc_now()
-    rules = []
+    rules = data.get("rules", [])
+    compacted = []
     removed = 0
-    for rule in data.get("rules", []):
+    for rule in rules:
+        if not isinstance(rule, dict):
+            compacted.append(rule)
+            continue
         expires_at = parse_time(rule.get("expires_at")) if isinstance(rule, dict) else None
         if expires_at and expires_at <= now:
             removed += 1
             continue
-        rules.append(rule)
-    if removed:
-        data["rules"] = rules
-        write_json(APPROVALS, data, 0o600)
+        if not rule.get("enabled", True):
+            compacted.append(rule)
+            continue
+        match_index = next(
+            (idx for idx, existing in enumerate(compacted) if isinstance(existing, dict) and existing.get("enabled", True) and same_network_rule(existing, rule)),
+            None,
+        )
+        if match_index is None:
+            compacted.append(rule)
+            continue
+        compacted[match_index] = merge_approval_rule(compacted[match_index], rule)
+        removed += 1
+    data["rules"] = compacted
     return removed
+
+
+def rule_ttl_rank(rule):
+    expires = parse_time(rule.get("expires_at"))
+    if not expires:
+        return dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    return expires
+
+
+def merge_approval_rule(left, right):
+    best = right if rule_ttl_rank(right) > rule_ttl_rank(left) else left
+    merged = dict(best)
+    created = min(
+        parse_time(left.get("created_at") or "") or utc_now(),
+        parse_time(right.get("created_at") or "") or utc_now(),
+    )
+    approved = max(approval_time(left), approval_time(right))
+    merged["created_at"] = created.isoformat()
+    merged["approved_at"] = approved.isoformat()
+    latest = right if approval_time(right) >= approval_time(left) else left
+    if latest.get("reason"):
+        merged["reason"] = latest["reason"]
+    return merged
 
 
 def active_approvals():
@@ -580,6 +639,7 @@ def add_rules(rules, ttl, reason):
             entry["expires_at"] = expires.isoformat()
         entry["reason"] = reason
         data["rules"].append(entry)
+    compact_approval_rules(data)
     write_json(APPROVALS, data, 0o600)
 
 
@@ -625,7 +685,62 @@ def request_files():
         if request.get("status", "pending") != "pending":
             continue
         found.append((path, request))
-    return sorted(found, key=lambda item: request_sort_time(item[1]), reverse=True)
+    return group_pending_requests(sorted(found, key=lambda item: request_sort_time(item[1]), reverse=True))
+
+
+def request_group_key(request):
+    payload = request.get("payload", {})
+    kind = request.get("kind")
+    if kind == "egress":
+        return ("egress", str(payload.get("host", "")).lower().rstrip("."), int(payload.get("port") or 443))
+    if kind in {"ssh", "ssh-lease"}:
+        return (kind, payload.get("target_key") or payload.get("alias") or payload.get("target") or "")
+    return (kind, request.get("dedupe_key") or json.dumps(payload, sort_keys=True))
+
+
+def group_pending_requests(rows):
+    grouped = []
+    by_key = {}
+    for path, request in rows:
+        key = request_group_key(request)
+        existing = by_key.get(key)
+        if existing is None:
+            request = dict(request)
+            request["__group_paths"] = [str(path)]
+            by_key[key] = (path, request)
+            grouped.append((path, request))
+            continue
+        _existing_path, existing_request = existing
+        existing_request["__group_paths"].append(str(path))
+        existing_request["seen_count"] = int(existing_request.get("seen_count") or 1) + int(request.get("seen_count") or 1)
+        if request_sort_time(request) > request_sort_time(existing_request):
+            existing_request["last_seen_at"] = request.get("last_seen_at") or request.get("created_at")
+        existing_payload = existing_request.setdefault("payload", {})
+        payload = request.get("payload", {})
+        protocols = sorted(set(existing_payload.get("protocols") or []) | set(payload.get("protocols") or []))
+        if protocols:
+            existing_payload["protocols"] = protocols
+    return grouped
+
+
+def request_group_paths(path, request):
+    paths = request.get("__group_paths") if isinstance(request, dict) else None
+    return [pathlib.Path(value) for value in paths] if paths else [path]
+
+
+def stored_request(request):
+    return {key: value for key, value in request.items() if not key.startswith("__")}
+
+
+def mark_request_group(path, request, status, reason=""):
+    count = 0
+    for group_path in request_group_paths(path, request):
+        current = read_json(group_path, {})
+        if not isinstance(current, dict):
+            current = stored_request(request)
+        mark_request(group_path, current, status, reason)
+        count += 1
+    return count
 
 
 def summarize(request):
@@ -754,16 +869,17 @@ def set_approval_ttl(rule_index, ttl):
 
 
 def block_request(path, request):
+    clean_request = stored_request(request)
     if request.get("kind") in {"ssh", "ssh-lease"}:
-        added = block_ssh_request(request)
-        mark_request(path, request, "denied", "forever denied by host operator")
+        added = block_ssh_request(clean_request)
+        mark_request_group(path, request, "denied", "forever denied by host operator")
         return added
-    rules = rules_for_request(request)
+    rules = rules_for_request(clean_request)
     if not rules:
         raise ValueError(f"{request.get('kind')} requests cannot be blocklisted by this operator")
     reason = request.get("payload", {}).get("reason") or summarize(request)
-    added = add_blocks(rules, reason, request)
-    mark_request(path, request, "denied", "forever denied by host operator")
+    added = add_blocks(rules, reason, clean_request)
+    mark_request_group(path, request, "denied", "forever denied by host operator")
     return added
 
 
@@ -1373,6 +1489,11 @@ def init_view_colors():
             curses.init_pair(VIEW_COLOR_PAIR_BASE + offset, foreground, background)
         except curses.error:
             return False
+    for offset, (_seconds, foreground, background) in enumerate(age_color_specs()):
+        try:
+            curses.init_pair(AGE_COLOR_PAIR_BASE + offset, foreground, background)
+        except curses.error:
+            return False
     return True
 
 
@@ -1388,6 +1509,43 @@ def request_area(request):
 
 def row_time(value):
     return timestamp_label(value) or "NO_TIMESTAMP"
+
+
+def age_color_specs():
+    return AGE_COLOR_SPECS_256 if curses.COLORS >= 256 else AGE_COLOR_SPECS_FALLBACK
+
+
+def item_time_for_age(view, item):
+    if view == "pending":
+        _path, request = item
+        return request.get("last_seen_at") or request.get("created_at")
+    if view == "leases":
+        _path, lease = item
+        return lease.get("created_at")
+    if view == "sessions":
+        _session_id, session = item
+        return session.get("started_at")
+    if view == "blacklist":
+        _kind, _rule_index, entry = item
+        return entry.get("blocked_at") or entry.get("created_at")
+    _rule_index, rule = item
+    return rule.get("approved_at") or rule.get("created_at")
+
+
+def age_row_attr(value, color_enabled, now):
+    if not color_enabled:
+        return 0
+    try:
+        parsed = parse_time(value or "")
+    except ValueError:
+        return 0
+    if not parsed:
+        return 0
+    age_seconds = max(0, int((now - parsed).total_seconds()))
+    for offset, (seconds, _foreground, _background) in enumerate(age_color_specs()):
+        if age_seconds < seconds:
+            return curses.color_pair(AGE_COLOR_PAIR_BASE + offset)
+    return 0
 
 
 def fit_cell(value, width, align="left"):
@@ -1686,23 +1844,24 @@ def prompt_line(stdscr, prompt):
 
 
 def approve_request(path, request, ttl, stdscr=None):
+    clean_request = stored_request(request)
     kind = request.get("kind")
     if kind == "ssh-lease" or (kind == "ssh" and request.get("payload", {}).get("lease", {}).get("requested")):
-        approve_ssh_lease(request, ttl)
-        mark_request(path, request, "approved", f"approved SSH lease for {ttl}")
+        approve_ssh_lease(clean_request, ttl)
+        mark_request_group(path, request, "approved", f"approved SSH lease for {ttl}")
         return
     if kind == "ssh":
         if stdscr is None:
             raise ValueError("SSH approval requires an interactive operator terminal")
-        session = start_host_ssh_session(request)
-        mark_request(path, request, "approved", f"opened host SSH via {session['launcher']}: {session['attach']}")
+        session = start_host_ssh_session(clean_request)
+        mark_request_group(path, request, "approved", f"opened host SSH via {session['launcher']}: {session['attach']}")
         return
-    rules = rules_for_request(request)
+    rules = rules_for_request(clean_request)
     if not rules:
         raise ValueError(f"{kind} requests cannot be auto-approved by this operator")
     reason = request.get("payload", {}).get("reason") or summarize(request)
     add_rules(rules, ttl, reason)
-    mark_request(path, request, "approved", f"approved egress for {ttl}")
+    mark_request_group(path, request, "approved", f"approved egress for {ttl}")
 
 
 def page_size(height):
@@ -1836,13 +1995,11 @@ def app(stdscr):
         help_text = help_text_for_view(view)
         draw_text(stdscr, 0, 0, "Hardened Jail Operator", curses.A_BOLD)
         draw_area_hint(stdscr, area)
-        draw_text(stdscr, 1, 0, f"home: {BASE}")
-        draw_full_width_text(
-            stdscr,
-            2,
-            f"area: {area}   view: {view}   {area_counts(area, requests, leases, sessions, approvals, blocks)}   ttl: {TTL_CHOICES[ttl_index]}",
-            view_header_attr(view, color_enabled),
-        )
+        draw_text(stdscr, 1, 0, f"{current_minute_label()}   {BASE}")
+        header = f"area: {area}   view: {view}   {area_counts(area, requests, leases, sessions, approvals, blocks)}   ttl: {TTL_CHOICES[ttl_index]}"
+        draw_full_width_text(stdscr, 2, header)
+        view_x = header.find(f"view: {view}") + len("view: ")
+        draw_text(stdscr, 2, view_x, view, view_header_attr(view, color_enabled))
         draw_text(stdscr, 3, 0, BROKER_STATUS[: width - 1])
         expired_messages = []
         if removed:
@@ -1855,38 +2012,41 @@ def app(stdscr):
         start = max(0, min(active_index, max(0, len(active_rows) - list_height)))
         visible_rows = active_rows[start:start + list_height]
         target_width = visible_target_width(view, visible_rows, width)
+        now = utc_now()
         for row, item in enumerate(visible_rows):
             item_index = start + row
-            attr = curses.A_REVERSE if item_index == active_index else 0
+            attr = age_row_attr(item_time_for_age(view, item), color_enabled, now)
+            if item_index == active_index:
+                attr |= curses.A_REVERSE
             if view == "pending":
                 _path, request = item
                 seen = int(request.get("seen_count") or 1)
                 count = f"x{seen}" if seen > 1 else "  "
-                prefix = f"{item_index + 1:2d} {row_time(request.get('last_seen_at') or request.get('created_at')):23s} {count:>4s} "
+                prefix = f"{item_index + 1:2d} {row_time(request.get('last_seen_at') or request.get('created_at')):{TIMESTAMP_WIDTH}s} {count:>4s} "
                 line = row_with_reason(prefix, target_from_request(request), request_reason(request), width, reason_width=22, target_width=target_width)
             elif view == "leases":
                 _path, lease = item
                 scopes = len(lease.get("scopes") or [])
                 anchors = len(lease.get("process_anchors") or [])
-                line = f"{item_index + 1:2d} {ttl_label(lease.get('expires_at')):10s} {timestamp_label(lease.get('created_at')):23s} {ssh_lease_target(lease):34s} scopes:{scopes:<2d} anchors:{anchors:<2d}"
+                line = f"{item_index + 1:2d} {ttl_label(lease.get('expires_at')):10s} {timestamp_label(lease.get('created_at')):{TIMESTAMP_WIDTH}s} {ssh_lease_target(lease):34s} scopes:{scopes:<2d} anchors:{anchors:<2d}"
             elif view == "sessions":
                 _session_id, session = item
-                line = f"{item_index + 1:2d} {session.get('status', ''):10s} {timestamp_label(session.get('started_at')):23s} {session.get('target', ''):30s} {session.get('command', '')}"
+                line = f"{item_index + 1:2d} {session.get('status', ''):10s} {timestamp_label(session.get('started_at')):{TIMESTAMP_WIDTH}s} {session.get('target', ''):30s} {session.get('command', '')}"
             elif view == "blacklist":
                 kind, _rule_index, entry = item
                 target = ssh_alias_target(entry) if kind == "ssh" else approval_target(entry)
-                prefix = f"{item_index + 1:2d} {row_time(entry.get('blocked_at') or entry.get('created_at')):23s} "
+                prefix = f"{item_index + 1:2d} {row_time(entry.get('blocked_at') or entry.get('created_at')):{TIMESTAMP_WIDTH}s} "
                 line = row_with_reason(prefix, target, entry.get("reason", ""), width, reason_width=24, target_width=target_width)
             else:
                 _rule_index, rule = item
-                prefix = f"{item_index + 1:2d} {ttl_label(rule.get('expires_at')):10s} {row_time(rule.get('approved_at') or rule.get('created_at')):23s} "
+                prefix = f"{item_index + 1:2d} {ttl_label(rule.get('expires_at')):10s} {row_time(rule.get('approved_at') or rule.get('created_at')):{TIMESTAMP_WIDTH}s} "
                 line = row_with_reason(prefix, approval_target(rule), rule.get("reason", ""), width, reason_width=24, target_width=target_width)
-            draw_text(stdscr, 6 + row, 0, line, attr)
+            draw_full_width_text(stdscr, 6 + row, line, attr)
         if active_rows and show_detail:
             y = 7 + list_height
             if view == "pending":
                 path, selected = active_rows[active_index]
-                lines = detail_lines(selected, TTL_CHOICES[ttl_index], path)
+                lines = detail_lines(stored_request(selected), TTL_CHOICES[ttl_index], path)
             elif view == "leases":
                 path, selected = active_rows[active_index]
                 lines = ssh_lease_detail_lines(path, selected)
@@ -2014,7 +2174,7 @@ def app(stdscr):
         elif key == ord("d") and view == "pending" and requests:
             path, request = requests[index]
             reason = prompt_line(stdscr, "deny reason: ") or "denied by host operator"
-            mark_request(path, request, "denied", reason)
+            mark_request_group(path, request, "denied", reason)
             message = f"denied {summarize(request)}"
         elif key == ord("x") and view == "pending" and requests:
             path, request = requests[index]

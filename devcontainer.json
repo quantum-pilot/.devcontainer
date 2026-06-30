@@ -2,43 +2,33 @@
   "name": "Vibe Coding Hardened Jail",
   "dockerComposeFile": "docker-compose.yml",
   "service": "worker",
-  "runServices": ["egress-proxy", "ssh-broker-proxy"],
+  "runServices": ["proxy"],
   "workspaceFolder": "/workspace",
   "remoteUser": "node",
   "shutdownAction": "stopCompose",
   "overrideCommand": false,
-  "initializeCommand": ".devcontainer/host/devcontainer-config && .devcontainer/host/jail-init && .devcontainer/host-start-chrome.sh",
+  "initializeCommand": ".devcontainer/host/jail-init && .devcontainer/host/jail-render-env && .devcontainer/host-start-chrome.sh",
   "containerEnv": {
-    "HTTP_PROXY": "http://egress-proxy:8080",
-    "HTTPS_PROXY": "http://egress-proxy:8080",
-    "ALL_PROXY": "http://egress-proxy:8080",
-    "NO_PROXY": "localhost,127.0.0.1,::1,egress-proxy,ssh-broker-proxy"
+    "HTTP_PROXY": "http://proxy:8080",
+    "HTTPS_PROXY": "http://proxy:8080",
+    "ALL_PROXY": "http://proxy:8080",
+    "NO_PROXY": "localhost,127.0.0.1,::1,proxy"
   },
   "customizations": {
     "jail": {
-      "buildArgs": {
-        "ENABLE_PYTHON": "true",
-        "PYTHON_VERSION": "3.12",
-        "ENABLE_GO": "true",
-        "GO_VERSION": "1.26.4",
-        "GO_ARCH": "amd64",
-        "ENABLE_RUST": "true",
-        "RUST_VERSION": "stable",
-        "ENABLE_PLAYWRIGHT": "true"
-      },
       "hostChrome": {
         "enabled": true,
         "port": 9222,
         "bind": "127.0.0.1",
         "profile": "$HOME/.chrome-remote-test"
-      }
+      },
+      "bridgePorts": [5432, 5435, 8787]
     },
     "vscode": {
       "extensions": [
         "dbaeumer.vscode-eslint",
         "eamodio.gitlens",
-        "esbenp.prettier-vscode",
-        "ms-python.python"
+        "esbenp.prettier-vscode"
       ],
       "settings": {
         "terminal.integrated.defaultProfile.linux": "zsh",

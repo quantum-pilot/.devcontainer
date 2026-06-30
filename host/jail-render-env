@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+config = json.loads((ROOT / "devcontainer.json").read_text(encoding="utf-8"))
+jail = config.get("customizations", {}).get("jail", {})
+ports = jail.get("bridgePorts", [])
+if isinstance(ports, int):
+    ports = [ports]
+ports = [str(int(port)) for port in ports]
+(ROOT / ".env").write_text(f"JAIL_BRIDGE_PORTS={','.join(ports)}\n", encoding="utf-8")

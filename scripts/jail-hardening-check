@@ -97,10 +97,10 @@ else
   check_fail "effective capabilities are not empty: $cap_eff"
 fi
 
-if [[ "${HTTP_PROXY:-}" == "http://egress-proxy:8080" && "${HTTPS_PROXY:-}" == "http://egress-proxy:8080" ]]; then
-  check_ok "proxy environment points at egress-proxy"
+if [[ "${HTTP_PROXY:-}" == "http://proxy:8080" && "${HTTPS_PROXY:-}" == "http://proxy:8080" ]]; then
+  check_ok "proxy environment points at proxy"
 else
-  check_fail "proxy environment is not configured for egress-proxy"
+  check_fail "proxy environment is not configured for proxy"
 fi
 
 pnpm_global_bin="${PNPM_HOME:-$HOME/.local/share/pnpm}/bin"
@@ -129,12 +129,6 @@ else
   check_fail "npm global prefix is not writable: ${NPM_CONFIG_PREFIX:-unset}"
 fi
 
-if [[ "${PLAYWRIGHT_BROWSERS_PATH:-}" == "$HOME/.local/share/ms-playwright" && -w "${PLAYWRIGHT_BROWSERS_PATH:-}" ]]; then
-  check_ok "Playwright browser path is writable under executable user-local storage"
-else
-  check_fail "Playwright browser path is not configured for executable user-local storage: ${PLAYWRIGHT_BROWSERS_PATH:-unset}"
-fi
-
 if command -v uv >/dev/null 2>&1 && command -v uvx >/dev/null 2>&1; then
   check_ok "uv and uvx are available"
 else
@@ -159,21 +153,43 @@ else
   check_fail "uv executable bin directories are not configured for user-local bin"
 fi
 
-for manager_bin in "${GOPATH:-$HOME/.local/share/go}/bin" "${CARGO_HOME:-$HOME/.local/share/cargo}/bin"; do
-  case ":$PATH:" in
-    *":$manager_bin:"*)
-      check_ok "$manager_bin is on PATH"
-      ;;
-    *)
-      check_fail "$manager_bin is missing from PATH"
-      ;;
-  esac
-done
-
-if [[ -d "${RUSTUP_HOME:-$HOME/.local/share/rustup}" && -w "${RUSTUP_HOME:-$HOME/.local/share/rustup}" ]]; then
-  check_ok "rustup home is writable"
+if [[ "${XDG_CONFIG_HOME:-}" == "$HOME/.local/config" && -w "${XDG_CONFIG_HOME:-}" ]]; then
+  check_ok "XDG config directory is writable"
 else
-  check_fail "rustup home is not writable"
+  check_fail "XDG config directory is not writable: ${XDG_CONFIG_HOME:-unset}"
+fi
+
+if [[ "${GNUPGHOME:-}" == "$HOME/.local/share/gnupg" && -d "${GNUPGHOME:-}" && -w "${GNUPGHOME:-}" && "$(stat -c %a "${GNUPGHOME:-}" 2>/dev/null)" == "700" ]]; then
+  check_ok "GnuPG home is writable"
+else
+  check_fail "GnuPG home is not private and writable: ${GNUPGHOME:-unset}"
+fi
+
+if command -v mise >/dev/null 2>&1; then
+  check_ok "mise is available"
+else
+  check_fail "mise is missing"
+fi
+
+if [[ "${MISE_DATA_DIR:-}" == "$HOME/.local/share/mise" && -w "${MISE_DATA_DIR:-}" ]]; then
+  check_ok "mise data directory is writable under executable user-local storage"
+else
+  check_fail "mise data directory is not writable: ${MISE_DATA_DIR:-unset}"
+fi
+
+case ":$PATH:" in
+  *":${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims:"*)
+    check_ok "mise shims are on PATH"
+    ;;
+  *)
+    check_fail "mise shims are missing from PATH"
+    ;;
+esac
+
+if [[ "${MISE_CONFIG_DIR:-}" == "$HOME/.local/share/mise/config" && -w "${MISE_CONFIG_DIR:-}" ]]; then
+  check_ok "mise config directory is writable for per-user trust/config"
+else
+  check_fail "mise config directory is not writable: ${MISE_CONFIG_DIR:-unset}"
 fi
 
 if [[ -d "${TMPDIR:-$HOME/.local/tmp}" && -w "${TMPDIR:-$HOME/.local/tmp}" ]]; then

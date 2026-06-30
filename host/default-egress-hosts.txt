@@ -1,0 +1,44 @@
+# Agent APIs
+platform.claude.com
+api.anthropic.com
+chatgpt.com
+auth.openai.com
+api.openai.com
+downloads.claude.ai
+mcp-proxy.anthropic.com
+
+# GitHub and release assets
+github.com
+api.github.com
+raw.githubusercontent.com
+release-assets.githubusercontent.com
+
+# JavaScript tooling
+registry.npmjs.org
+nodejs.org
+
+# Python tooling
+pypi.org
+files.pythonhosted.org
+
+# Rust tooling
+sh.rustup.rs
+static.rust-lang.org
+crates.io
+index.crates.io
+
+# mise
+mise.en.dev
+mise-versions.jdx.dev
+
+# Google
+dl.google.com
+storage.googleapis.com
+
+# Huggingface
+cas-server.xethub.hf.co
+huggingface.co
+
+# Others
+host.docker.internal:9222 http
+tuf-repo-cdn.sigstore.dev

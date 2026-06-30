@@ -4,22 +4,24 @@ import select
 import socket
 import socketserver
 import sys
+import threading
 
 
 BIND = os.environ.get("TCP_FORWARD_BIND", "0.0.0.0")
 PORT = int(os.environ.get("TCP_FORWARD_PORT", "8822"))
+PORTS = os.environ.get("TCP_FORWARD_PORTS", "")
 TARGET_HOST = os.environ.get("TCP_FORWARD_TARGET_HOST", "host.docker.internal")
-TARGET_PORT = int(os.environ.get("TCP_FORWARD_TARGET_PORT", "8822"))
 BUFFER_SIZE = 64 * 1024
 
 
 class ForwardHandler(socketserver.BaseRequestHandler):
     def handle(self):
+        target_port = self.server.server_address[1]
         try:
-            upstream = socket.create_connection((TARGET_HOST, TARGET_PORT), timeout=10)
+            upstream = socket.create_connection((TARGET_HOST, target_port), timeout=10)
         except OSError as exc:
             print(
-                f"tcp-forwarder: cannot connect to {TARGET_HOST}:{TARGET_PORT}: {exc}",
+                f"tcp-forwarder: cannot connect to {TARGET_HOST}:{target_port}: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -48,13 +50,23 @@ class ThreadingForwarder(socketserver.ThreadingTCPServer):
 
 
 def main():
-    print(
-        f"tcp-forwarder: listening on {BIND}:{PORT}, forwarding to {TARGET_HOST}:{TARGET_PORT}",
-        file=sys.stderr,
-        flush=True,
-    )
-    with ThreadingForwarder((BIND, PORT), ForwardHandler) as server:
-        server.serve_forever()
+    ports = sorted({PORT} | {int(port) for port in PORTS.replace(" ", "").split(",") if port})
+    servers = []
+    for port in ports:
+        server = ThreadingForwarder((BIND, port), ForwardHandler)
+        servers.append(server)
+        print(
+            f"tcp-forwarder: listening on {BIND}:{port}, forwarding to {TARGET_HOST}:{port}",
+            file=sys.stderr,
+            flush=True,
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        threading.Event().wait()
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
