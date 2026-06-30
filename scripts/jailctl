@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import sys
 import time
@@ -19,15 +20,99 @@ def utc_now():
     return dt.datetime.now(dt.timezone.utc)
 
 
+def request_dedupe_key(kind, payload):
+    if kind == "egress":
+        raw = f"egress:{payload.get('host', '').lower().rstrip('.')}:{int(payload.get('port') or 443)}"
+    elif kind in {"ssh", "ssh-lease"}:
+        raw = f"{kind}:{payload.get('target_key') or payload.get('alias') or payload.get('target')}"
+    elif kind == "install":
+        raw = f"install:{os.getcwd()}:{payload.get('manager')}:{json.dumps(payload.get('arguments') or [], sort_keys=True)}"
+    elif kind == "agent-login":
+        raw = f"agent-login:{payload.get('agent')}"
+    else:
+        raw = f"{kind}:{json.dumps(payload, sort_keys=True)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def pending_request_path(dedupe_key):
+    for path in REQUEST_DIR.glob("*.json"):
+        request = read_json(path)
+        if not isinstance(request, dict):
+            continue
+        if request.get("status", "pending") != "pending":
+            continue
+        if request.get("dedupe_key") == dedupe_key:
+            return path
+    return None
+
+
+def scope_key(scope):
+    return (scope.get("sid"), scope.get("pgid"), scope.get("pid"), scope.get("uid"))
+
+
+def request_scopes_from_payload(payload):
+    scopes = []
+    for scope in (payload.get("scope"), payload.get("lease", {}).get("scope")):
+        if isinstance(scope, dict) and scope:
+            scopes.append(scope)
+    return scopes
+
+
+def merge_payload(existing_payload, incoming_payload):
+    merged = dict(existing_payload)
+    for key, value in incoming_payload.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+
+    protocols = sorted(set(existing_payload.get("protocols") or []) | set(incoming_payload.get("protocols") or []))
+    if protocols:
+        merged["protocols"] = protocols
+
+    scopes = []
+    seen = set()
+    for scope in existing_payload.get("scopes") or []:
+        if isinstance(scope, dict) and scope_key(scope) not in seen:
+            scopes.append(scope)
+            seen.add(scope_key(scope))
+    for scope in request_scopes_from_payload(existing_payload) + request_scopes_from_payload(incoming_payload):
+        if scope_key(scope) not in seen:
+            scopes.append(scope)
+            seen.add(scope_key(scope))
+    if scopes:
+        merged["scopes"] = scopes
+    return merged
+
+
+def merge_pending_request(path, payload):
+    request = read_json(path) or {}
+    request["last_seen_at"] = utc_now().isoformat()
+    request["seen_count"] = int(request.get("seen_count") or 1) + 1
+    request["last_cwd"] = os.getcwd()
+    request["payload"] = merge_payload(request.get("payload", {}), payload)
+    path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def write_request(kind, payload):
     REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    dedupe_key = request_dedupe_key(kind, payload)
+    existing = pending_request_path(dedupe_key)
+    if existing:
+        path = merge_pending_request(existing, payload)
+        print(f"request merged: {path}", flush=True)
+        print("approve from the host with .devcontainer/host/jail-operator", flush=True)
+        return path
     request_id = f"{utc_now().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+    now = utc_now().isoformat()
     path = REQUEST_DIR / f"{request_id}.json"
     request = {
         "id": request_id,
         "kind": kind,
         "status": "pending",
-        "created_at": utc_now().isoformat(),
+        "dedupe_key": dedupe_key,
+        "created_at": now,
+        "last_seen_at": now,
+        "seen_count": 1,
         "cwd": os.getcwd(),
         "payload": payload,
     }
@@ -68,9 +153,10 @@ def process_tree():
                 stat = fh.read().split()
             ppid = int(stat[3])
             comm = stat[1].strip("()")
+            starttime = stat[21]
         except (OSError, IndexError, ValueError):
             break
-        tree.append({"pid": pid, "comm": comm})
+        tree.append({"pid": pid, "comm": comm, "starttime": starttime})
         pid = ppid
     return tree
 
@@ -84,6 +170,40 @@ def session_scope():
         "uid": os.getuid(),
         "tree": process_tree(),
     }
+
+
+def anchor_key(anchor):
+    return (
+        anchor.get("pid"),
+        anchor.get("comm"),
+        anchor.get("starttime"),
+        anchor.get("uid"),
+    )
+
+
+def process_anchors(scopes):
+    anchors = []
+    seen = set()
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        uid = scope.get("uid")
+        entries = list(scope.get("tree") or [])
+        entries.append({"pid": scope.get("pid"), "comm": scope.get("comm", ""), "starttime": scope.get("starttime", "")})
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("pid"):
+                continue
+            anchor = {
+                "pid": entry.get("pid"),
+                "comm": entry.get("comm", ""),
+                "starttime": entry.get("starttime", ""),
+                "uid": uid,
+            }
+            key = anchor_key(anchor)
+            if key not in seen:
+                anchors.append(anchor)
+                seen.add(key)
+    return anchors
 
 
 def read_json(path):
@@ -101,24 +221,85 @@ def parse_expiry(value):
     return dt.datetime.fromisoformat(value)
 
 
-def live_ssh_lease(alias):
+def live_ssh_lease(target_key):
     now = utc_now()
-    sid = os.getsid(0)
-    pgid = os.getpgrp()
+    current_scope = session_scope()
+    sid = current_scope.get("sid")
+    pgid = current_scope.get("pgid")
+    current_anchor_keys = {anchor_key(anchor) for anchor in process_anchors([current_scope])}
     candidates = []
     for path in sorted(SSH_LEASE_DIR.glob("*.json")):
         lease = read_json(path)
         if not isinstance(lease, dict):
             continue
-        if lease.get("alias") != alias:
+        lease_key = lease.get("target_key") or lease.get("alias")
+        if lease_key != target_key:
             continue
         expires_at = parse_expiry(lease.get("expires_at"))
         if expires_at and now >= expires_at:
             continue
-        scope = lease.get("scope", {})
-        if scope.get("sid") == sid or scope.get("pgid") == pgid:
+        scopes = [scope for scope in lease.get("scopes") or [] if isinstance(scope, dict)]
+        if not scopes:
+            scopes = [lease.get("scope", {})]
+        if any(scope.get("sid") == sid or scope.get("pgid") == pgid for scope in scopes):
+            candidates.append((path, lease))
+            continue
+        lease_anchor_keys = {
+            anchor_key(anchor)
+            for anchor in (lease.get("process_anchors") or [])
+            if isinstance(anchor, dict)
+        }
+        if current_anchor_keys and current_anchor_keys & lease_anchor_keys:
             candidates.append((path, lease))
     return candidates[-1] if candidates else (None, None)
+
+
+def split_ssh_target(target, user, port):
+    if "@" in target:
+        target_user, target_host = target.rsplit("@", 1)
+        user = user or target_user
+    else:
+        target_host = target
+    if target_host.startswith("["):
+        host, _, rest = target_host[1:].partition("]")
+        if rest.startswith(":"):
+            port = int(rest[1:])
+        target_host = host
+    elif ":" in target_host and target_host.rsplit(":", 1)[1].isdigit():
+        target_host, port_text = target_host.rsplit(":", 1)
+        port = int(port_text)
+    return user, target_host, int(port)
+
+
+def looks_like_raw_ssh_target(target):
+    return "@" in target or "." in target or ":" in target
+
+
+def ssh_payload(target, args):
+    is_raw = looks_like_raw_ssh_target(target)
+    payload = {
+        "target": target,
+        "remote_command": getattr(args, "command", ""),
+        "features": {
+            "agent_forwarding": False,
+            "x11_forwarding": False,
+            "port_forwarding": False,
+        },
+    }
+    if is_raw:
+        user, host, port = split_ssh_target(target, getattr(args, "user", ""), getattr(args, "port", 22))
+        payload.update({
+            "host": host,
+            "user": user,
+            "port": port,
+            "target_key": f"{user + '@' if user else ''}{host}:{port}",
+        })
+    else:
+        payload.update({
+            "alias": target,
+            "target_key": target,
+        })
+    return payload
 
 
 def file_sha256(path):
@@ -164,7 +345,15 @@ def cmd_egress(args):
 
 
 def cmd_ssh(args):
-    lease_path, lease = live_ssh_lease(args.alias)
+    if not args.lease:
+        command = ["ssh", args.target]
+        if args.command:
+            command.extend(shlex.split(args.command))
+        os.environ["JAIL_SSH_DEFAULT_TTL"] = args.ttl
+        os.execvp(command[0], command)
+
+    payload = ssh_payload(args.target, args)
+    lease_path, lease = live_ssh_lease(payload["target_key"])
     if lease:
         print(f"ssh lease active: {lease_path}")
         print("open or reuse the matching host-side session from .devcontainer/host/jail-operator; no new approval request was created")
@@ -172,20 +361,14 @@ def cmd_ssh(args):
             print(f"requested remote command: {args.command}")
         return 0
 
-    path = write_request("ssh", {
-        "alias": args.alias,
-        "remote_command": args.command,
+    payload.update({
         "lease": {
             "requested": args.lease,
             "scope": session_scope(),
             "ttl": args.ttl,
         },
-        "features": {
-            "agent_forwarding": False,
-            "x11_forwarding": False,
-            "port_forwarding": False,
-        },
     })
+    path = write_request("ssh", payload)
     if args.wait:
         return wait_for_resolution(path, args.wait_timeout)
     return 0
@@ -212,16 +395,12 @@ def cmd_install(args):
 
 
 def cmd_ssh_lease(args):
-    path = write_request("ssh-lease", {
-        "alias": args.alias,
+    payload = ssh_payload(args.target, args)
+    payload.update({
         "ttl": args.ttl,
         "scope": session_scope(),
-        "features": {
-            "agent_forwarding": False,
-            "x11_forwarding": False,
-            "port_forwarding": False,
-        },
     })
+    path = write_request("ssh-lease", payload)
     if args.wait:
         return wait_for_resolution(path, args.wait_timeout)
     return 0
@@ -244,6 +423,10 @@ def cmd_agent_login(args):
     if args.no_exec:
         return 0
     command = commands[args.agent]
+    if args.agent == "claude":
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+    if args.agent == "codex":
+        os.environ.pop("OPENAI_BASE_URL", None)
     os.execvp(command[0], command)
 
 
@@ -262,17 +445,22 @@ def main():
     egress.set_defaults(func=cmd_egress)
 
     ssh = sub.add_parser("ssh", help="request an approved host-side SSH session")
-    ssh.add_argument("alias")
+    ssh.add_argument("target", help="saved alias or direct target like user@host[:port]")
     ssh.add_argument("--command", default="")
     ssh.add_argument("--lease", action="store_true", help="request a reusable lease for this process session")
     ssh.add_argument("--ttl", default="30m")
+    ssh.add_argument("--user", default="", help="user for direct host targets")
+    ssh.add_argument("--port", type=int, default=22, help="port for direct host targets")
     ssh.add_argument("--wait", action="store_true", help="wait for host approval or denial")
     ssh.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
     ssh.set_defaults(func=cmd_ssh)
 
     lease = sub.add_parser("ssh-lease", help="request a reusable SSH lease for this process session")
-    lease.add_argument("alias")
+    lease.add_argument("target", help="saved alias or direct target like user@host[:port]")
     lease.add_argument("--ttl", default="30m")
+    lease.add_argument("--user", default="", help="user for direct host targets")
+    lease.add_argument("--port", type=int, default=22, help="port for direct host targets")
+    lease.set_defaults(command="")
     lease.add_argument("--wait", action="store_true", help="wait for host approval or denial")
     lease.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
     lease.set_defaults(func=cmd_ssh_lease)

@@ -1,0 +1,305 @@
+# Hardened Devcontainer Design
+
+This document describes how the jailed devcontainer works. The user-facing setup
+and daily commands live in [README.md](README.md).
+
+## Topology
+
+VS Code starts three Compose services:
+
+- `worker`: the development container where commands, agents, and editors run.
+- `egress-proxy`: the only service attached to the outbound `internet` network.
+- `ssh-broker-proxy`: a narrow TCP forwarder from the internal jail network to
+  the host operator's SSH broker port.
+
+The worker is attached only to the internal `jail_net` network and receives
+standard proxy environment variables that point to `http://egress-proxy:8080`.
+Tools that honor proxy variables route through the proxy. Tools that ignore
+proxy variables have no direct internet route. The worker also reaches
+`ssh-broker-proxy:8822`, which only forwards to the host operator's SSH broker.
+
+## Worker Boundary
+
+The worker is deliberately constrained:
+
+- no passwordless sudo
+- no Docker socket mount
+- no host SSH keys or SSH agent socket
+- no direct host Claude/Codex config mounts
+- no direct internet route
+- no writable in-container firewall
+- all Linux capabilities dropped
+- `no-new-privileges` enabled
+- read-only root filesystem with tmpfs scratch paths
+
+The workspace is still mounted at `/workspace`. Anything readable there is
+readable by processes inside the jail.
+
+## Host State
+
+Host-managed jail state is rooted at:
+
+```text
+$HOME/.devcontainer-jail
+```
+
+`host/jail-init` creates:
+
+```text
+policy/approvals.json
+policy/ssh-allowlist.json
+policy/ssh-leases/
+requests/
+state/
+```
+
+Set `DEVCONTAINER_JAIL_HOME` before launching VS Code to use a different host
+state directory.
+
+The worker cannot read host approval policy directly. The egress proxy mounts
+the policy read-only, and both the worker/proxy and host operator share the
+request directory as file-based IPC.
+
+## Request IPC
+
+Requests are JSON files in `$DEVCONTAINER_JAIL_HOME/requests`.
+
+The worker writes requests through `jailctl`. The egress proxy writes automatic
+egress requests when a default-denied proxy-aware connection arrives. The host
+operator live-refreshes this directory and marks requests approved or denied.
+
+Pending requests include `dedupe_key`, `created_at`, `last_seen_at`, and
+`seen_count`. Repeated attempts for the same target merge into the existing
+pending request and bump `last_seen_at`/`seen_count` instead of creating a queue
+of duplicates.
+
+The operator keeps completed request files for audit/debug context, but only
+pending requests are shown in the pending view.
+
+## Egress Policy
+
+The egress proxy evaluates policy in this order:
+
+1. block rules
+2. allow rules
+3. default deny
+
+Default-denied HTTP/HTTPS proxy requests create or merge a pending egress
+request and hold the client connection while waiting for operator approval. If
+the operator approves before the client times out, the original request
+continues. If the operator denies or a block rule appears, the request fails.
+
+Blocks are enforced before approvals. A blocklisted target fails immediately and
+does not create repeated pending requests.
+
+Approvals can be time-limited or `forever`. Expired approvals are pruned by the
+operator refresh loop so they do not remain in the active approval list.
+
+`host/jail-init` seeds one-time, exact-host, forever approvals for common agent
+endpoints. The seed marker prevents revoked defaults from being recreated on
+every init.
+
+## Operator
+
+`host/jail-operator` is the single host-side TTY for approvals. It provides
+views for:
+
+- pending requests
+- active SSH leases
+- SSH sessions
+- active approvals
+- blacklist
+
+Controls include arrow movement, Page Up/Page Down, Space/Shift+Space-style page
+navigation through Space/`b`, Enter for details, `tab` to switch views, `s` to
+toggle time/alphabetical sorting, and `q`, Ctrl+C, or Ctrl+D to quit.
+
+The bottom help line is contextual. Pending requests support approve, deny, and
+forever-deny. The SSH leases view shows active broker leases with TTLs, scope
+counts, process-anchor counts, and revoke. The SSH sessions view shows live and
+recent completed brokered SSH connections. Approvals support TTL changes and
+revoke. Blacklist supports unblock.
+
+## SSH Brokerage
+
+The worker has no host private keys and no `SSH_AUTH_SOCK`.
+
+`scripts/ssh` is installed as `/usr/local/bin/ssh`, and `/usr/bin/ssh` is
+replaced with a symlink to that shim. The original in-container OpenSSH client
+is left non-executable so hardcoded `/usr/bin/ssh` callers still go through the
+broker. `GIT_SSH=/usr/local/bin/ssh` makes Git use the same path.
+
+The shim parses common OpenSSH-compatible arguments, normalizes the target, and
+connects to `ssh-broker-proxy:8822` on the internal jail network. That sidecar
+forwards only this TCP port to the host broker started inside
+`host/jail-operator`. The host broker listens on
+`JAIL_SSH_BROKER_BIND:JAIL_SSH_BROKER_PORT`, defaulting to `0.0.0.0:8822`, and
+authenticates each request with a random token generated by `host/jail-init` at:
+
+```text
+$DEVCONTAINER_JAIL_HOME/state/ssh-broker-token
+```
+
+The token is mounted read-only into the worker as `/jail-ssh-broker-token`.
+
+Broker flow:
+
+1. The worker `ssh` shim sends the normalized target, safe SSH options, remote
+   command arguments, terminal mode, and process/session scope to the host
+   broker.
+2. The host broker checks the SSH blocklist and active SSH leases.
+3. If no matching lease exists, the broker creates or merges a pending `ssh`
+   request and holds the jailed `ssh` process while the operator waits for
+   approval.
+4. Approval writes a TTL-bound lease under `policy/ssh-leases/`.
+5. The broker starts real host `ssh` with host keys/config and relays data back
+   to the jailed process.
+
+SSH leases match the target plus either the original terminal/session group or
+stable process-tree anchors from the requesting agent/shell ancestry. This lets
+repeated Codex or Claude tool invocations reuse one approval without turning the
+lease into a target-wide host approval.
+
+Non-interactive SSH uses separate stdout/stderr frames, so Git and other SSH
+transport users receive clean protocol streams. Interactive SSH uses a host PTY
+and forwards terminal resize messages.
+
+The broker intentionally rejects SSH features that would bypass the jail's
+network policy or expose extra host authority: local/remote/dynamic forwarding,
+stdio forwarding, jump/proxy commands, agent forwarding, X11 forwarding, local
+commands, host control sockets, and arbitrary container-provided identity files.
+Direct SSH targets are the normal path. The underlying policy file still
+supports host-side aliases for identity-file/default-command metadata, but the
+default operator TUI does not expose aliases as a primary workflow.
+
+## Agent State
+
+Agent credentials are persisted in jail-owned Docker volumes, not direct mounts
+of the host user's primary agent config directories.
+
+Important mounts include:
+
+```text
+/home/node/.claude
+/home/node/.claude-home
+/home/node/.codex
+/home/node/.agents
+/home/node/.gsd
+/home/node/.local
+/shell_history
+```
+
+`/home/node/.local` is one persisted executable volume for user-installed tools:
+pnpm globals, npm globals, uv tools, Headroom state, rustup/cargo state, and Go
+workspace binaries. This avoids separate Docker volumes for every package
+manager while keeping the read-only home boundary.
+
+Claude Code uses both `~/.claude/` and home-level `~/.claude.json` style state.
+Because `/home/node` is read-only, the image creates:
+
+```text
+/home/node/.claude.json -> /home/node/.claude-home/claude.json
+/home/node/.claude.json.backup -> /home/node/.claude-home/claude.json.backup
+```
+
+`hardened-agent-claude-home` persists the symlink target.
+
+## Headroom
+
+`jail-start` starts `headroom-proxy` in a detached tmux session named
+`headroom` when both `tmux` and `headroom` are available.
+
+The proxy binds inside the worker at:
+
+```text
+127.0.0.1:8787
+```
+
+Interactive shells export:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+```
+
+`headroom-proxy` unsets those variables before starting Headroom so the proxy
+does not route upstream requests back into itself.
+
+`jailctl agent-login claude` unsets `ANTHROPIC_BASE_URL` for the login command,
+and `jailctl agent-login codex` unsets `OPENAI_BASE_URL`, so authentication can
+use the official upstream login paths.
+
+## Package Managers
+
+`jailctl install --run ...` creates an install request, waits for approval, and
+executes the package-manager command in the same worker TTY. The request records
+the manager, arguments, current project path, and known lockfile hashes.
+
+The default image is Node/JavaScript first. It installs Node, npm, pnpm, uv/uvx,
+Claude Code, Codex CLI, Graphify, GSD Core, Headroom, Ponytail, and Python venv
+support. Python package workflows should prefer `uv`, `uvx`, and `uv pip`; raw
+`pip` is supported inside project, stdlib `venv`, or uv-created virtual
+environments.
+
+User-installed uv tools and uv-managed Python interpreters live under
+`/home/node/.local/share/uv`, with generated executables linked into
+`/home/node/.local/bin`. The uv cache lives under `/home/node/.local/cache/uv`
+because uvx may execute cached tool environments; `/home/node/.cache` remains
+non-executable scratch storage.
+
+Playwright browser binaries use `/home/node/.local/share/ms-playwright` for the
+same reason: the default cache mount is non-executable. Optional Rust
+preinstallation exposes wrappers in `/usr/local/bin` that point rustup at the
+read-only `/usr/local/rustup` toolchain while leaving `CARGO_HOME` writable
+under `/home/node/.local/share/cargo`. On-demand rustup installs still use the
+user-local `RUSTUP_HOME` and `CARGO_HOME`.
+
+The Dockerfile keeps common, expensive layers before optional language toolchain
+layers. Runtime-only environment such as proxies and broker addresses is near
+the end so policy edits do not invalidate apt/npm/uv install layers.
+
+Optional build args are configured in `customizations.jail.buildArgs` in
+`devcontainer.json`. `host/devcontainer-config` renders those values to the
+Compose `.env` file before VS Code builds the services, because Docker Compose
+still performs build-arg interpolation from its environment.
+
+```text
+ENABLE_PYTHON=false
+PYTHON_VERSION=3.12
+ENABLE_GO=false
+GO_VERSION=1.26.4
+GO_ARCH=amd64
+ENABLE_RUST=false
+RUST_VERSION=stable
+ENABLE_PLAYWRIGHT=false
+```
+
+When optional toolchains are disabled, users can still install them on demand
+under `/home/node/.local`, which is persisted and executable.
+
+## Browser Bridge
+
+`devcontainer.json` runs `host-start-chrome.sh` during `initializeCommand`.
+Configuration is read from `customizations.jail.hostChrome` in
+`devcontainer.json`.
+
+By default, the bridge starts Google Chrome on macOS when `open`, `lsof`, and
+Google Chrome are available. It uses a dedicated profile and binds Chrome
+DevTools Protocol to `127.0.0.1`.
+
+## Verification
+
+`scripts/jail-hardening-check` verifies the important boundary assumptions
+inside the worker, including:
+
+- no passwordless sudo
+- no Docker socket
+- no SSH agent socket or private keys
+- agent state mounts present
+- Claude home-level state persistence
+- no host approval policy visible in the worker
+- `no_new_privs`, seccomp, and empty effective capabilities
+- proxy environment
+- pnpm/npm/uv install path
+- executable persisted user-local tool directory
+- no setuid/setgid files on the root filesystem

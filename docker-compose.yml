@@ -3,6 +3,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ENABLE_PYTHON: ${ENABLE_PYTHON:-false}
+        ENABLE_GO: ${ENABLE_GO:-false}
+        ENABLE_RUST: ${ENABLE_RUST:-false}
+        ENABLE_PLAYWRIGHT: ${ENABLE_PLAYWRIGHT:-false}
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        GO_VERSION: ${GO_VERSION:-1.26.4}
+        GO_ARCH: ${GO_ARCH:-amd64}
+        RUST_VERSION: ${RUST_VERSION:-stable}
     init: true
     tty: true
     command: jail-start
@@ -18,30 +27,35 @@ services:
       - /var/tmp:rw,nosuid,nodev,noexec,size=512m
       - /home/node/.cache:rw,nosuid,nodev,uid=1000,gid=1000,size=2g
       - /home/node/.npm:rw,nosuid,nodev,uid=1000,gid=1000,size=1g
-      - /home/node/.local:rw,nosuid,nodev,uid=1000,gid=1000,size=1g
     environment:
       HTTP_PROXY: http://egress-proxy:8080
       HTTPS_PROXY: http://egress-proxy:8080
       ALL_PROXY: http://egress-proxy:8080
-      NO_PROXY: localhost,127.0.0.1,::1,egress-proxy
+      NO_PROXY: localhost,127.0.0.1,::1,egress-proxy,ssh-broker-proxy
       npm_config_proxy: http://egress-proxy:8080
       npm_config_https_proxy: http://egress-proxy:8080
+      GIT_SSH: /usr/local/bin/ssh
+      JAIL_SSH_BROKER_HOST: ssh-broker-proxy
+      JAIL_SSH_BROKER_PORT: "8822"
+      JAIL_SSH_BROKER_TOKEN_FILE: /jail-ssh-broker-token
     volumes:
       - ..:/workspace:delegated
       - hardened-vscode-server:/home/node/.vscode-server
       - hardened-shell-history:/shell_history
       - hardened-agent-claude:/home/node/.claude
+      - hardened-agent-claude-home:/home/node/.claude-home
       - hardened-agent-codex:/home/node/.codex
       - hardened-agent-state:/home/node/.agents
       - hardened-gsd:/home/node/.gsd
-      - hardened-headroom:/home/node/.local/share/headroom
-      - hardened-pnpm:/home/node/.local/share/pnpm
+      - hardened-user-local:/home/node/.local
       - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/requests:/jail-requests
       - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/policy/ssh-leases:/jail-ssh-leases:ro
+      - ${DEVCONTAINER_JAIL_HOME:-${HOME}/.devcontainer-jail}/state/ssh-broker-token:/jail-ssh-broker-token:ro
     networks:
       - jail_net
     depends_on:
       - egress-proxy
+      - ssh-broker-proxy
 
   egress-proxy:
     build:
@@ -71,6 +85,30 @@ services:
       - jail_net
       - internet
 
+  ssh-broker-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    entrypoint: ["/usr/local/bin/tcp-forwarder"]
+    environment:
+      TCP_FORWARD_BIND: 0.0.0.0
+      TCP_FORWARD_PORT: "8822"
+      TCP_FORWARD_TARGET_HOST: host.docker.internal
+      TCP_FORWARD_TARGET_PORT: "8822"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - jail_net
+      - internet
+
 networks:
   jail_net:
     internal: true
@@ -80,8 +118,8 @@ volumes:
   hardened-vscode-server:
   hardened-shell-history:
   hardened-agent-claude:
+  hardened-agent-claude-home:
   hardened-agent-codex:
   hardened-agent-state:
   hardened-gsd:
-  hardened-headroom:
-  hardened-pnpm:
+  hardened-user-local:

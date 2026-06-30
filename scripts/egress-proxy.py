@@ -64,7 +64,7 @@ def append_log(record):
 
 
 def request_key(protocol, host, port):
-    raw = f"egress:{protocol}:{host.lower().rstrip('.')}:{int(port or 443)}"
+    raw = f"egress:{host.lower().rstrip('.')}:{int(port or 443)}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -87,20 +87,38 @@ def pending_request_path(key):
     return None
 
 
+def merge_pending_request(path, protocol, target, reason):
+    request = read_json(path)
+    if not isinstance(request, dict):
+        return path
+    payload = request.setdefault("payload", {})
+    protocols = sorted(set(payload.get("protocols") or []) | {protocol})
+    payload["protocols"] = protocols
+    payload["target"] = target
+    payload["deny_reason"] = reason
+    request["last_seen_at"] = utc_now().isoformat()
+    request["seen_count"] = int(request.get("seen_count") or 1) + 1
+    path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def write_auto_request(protocol, host, port, target, reason):
     key = request_key(protocol, host, port)
     try:
         REQUEST_DIR.mkdir(parents=True, exist_ok=True)
         existing = pending_request_path(key)
         if existing:
-            return existing
+            return merge_pending_request(existing, protocol, target, reason)
         request_id = f"{utc_now().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+        now = utc_now().isoformat()
         request = {
             "id": request_id,
             "kind": "egress",
             "status": "pending",
             "dedupe_key": key,
-            "created_at": utc_now().isoformat(),
+            "created_at": now,
+            "last_seen_at": now,
+            "seen_count": 1,
             "cwd": "",
             "source": "egress-proxy",
             "payload": {
@@ -291,7 +309,7 @@ Use one of these request paths instead of retrying direct network commands:
     jailctl agent-login claude
 
   SSH:
-    jailctl ssh <approved-alias>
+    ssh <target-or-alias>
     jailctl ssh-lease <approved-alias> --ttl 30m --wait
 
 Host approval:
@@ -351,7 +369,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             "guidance": {
                 "egress": ".devcontainer/host/jail-operator",
                 "install": "jailctl install --run <manager> <args...>",
-                "ssh": "jailctl ssh <approved-alias>",
+                "ssh": "ssh <target-or-alias>",
             },
         }
         if extra:

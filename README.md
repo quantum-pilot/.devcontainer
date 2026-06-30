@@ -1,43 +1,12 @@
 # Hardened LLM Devcontainer
 
-This repository is a single safe-by-default `.devcontainer` setup for AI-assisted development. A user should be able to copy this folder into a project, open the project in VS Code, and build the devcontainer directly.
+A safe-by-default `.devcontainer` setup for AI-assisted development. Copy this
+directory into a project, open the project in VS Code, and build the
+devcontainer from the Dev Containers UI.
 
-## What Starts
+For implementation details, see [DESIGN.md](DESIGN.md).
 
-VS Code uses [devcontainer.json](devcontainer.json), which starts [docker-compose.yml](docker-compose.yml):
-
-- `worker`: the development container where AI/dev commands run.
-- `egress-proxy`: the only service with outbound internet access.
-
-The worker image includes Claude Code (`claude`), Codex CLI (`codex`),
-Graphify (`graphify`), GSD Core (`gsd-core`, `gsd-tools`, `gsd_run`), Headroom
-(`headroom`), Ponytail (`ponytail`), `pnpm`, and `uv`.
-
-Do not run the `Dockerfile` directly for normal use. The worker image alone can start, but approval-based networking depends on the `egress-proxy` sidecar.
-
-## Security Model
-
-The worker is intentionally restricted:
-
-- no passwordless sudo
-- no Docker socket mount
-- no host SSH keys or SSH agent socket
-- no host Claude/Codex credential mounts
-- no direct internet route
-- no in-container firewall that the worker can rewrite
-- all Linux capabilities dropped
-- `no-new-privileges` enabled
-- read-only root filesystem with tmpfs scratch paths
-
-Claude, Codex, and related agent tools run inside the worker. Their login state
-is intentionally persisted in Docker named volumes mounted at paths such as
-`/home/node/.claude` and `/home/node/.codex`. Agent credentials are therefore
-available to processes inside the jail, but they are not direct mounts of the
-host's primary agent config directories.
-
-The workspace is still mounted broadly at `/workspace`. Files readable there are readable by the worker. Keep real secrets outside the workspace or mask them separately.
-
-## Setup On A New Machine
+## Setup
 
 Prerequisites:
 
@@ -50,40 +19,19 @@ Install:
 1. Copy this directory as `.devcontainer` into the target project.
 2. Open the project folder in VS Code.
 3. Run `Dev Containers: Reopen in Container`.
-4. VS Code runs `.devcontainer/host/jail-init` automatically and builds both Compose services.
-5. After the container opens, the post-create check runs `jail-hardening-check`.
+4. VS Code runs `.devcontainer/host/jail-init` automatically and builds the services.
+5. After the container opens, `jail-hardening-check` runs.
 
-Manual CLI equivalent:
-
-```bash
-devcontainer up --workspace-folder .
-```
-
-Initialize host-owned state manually if needed:
-
-```bash
-.devcontainer/host/jail-init
-```
-
-Host-owned state is stored outside the project:
+Host-owned jail state lives outside the project at:
 
 ```text
-$HOME/.devcontainer-jail/policy
-$HOME/.devcontainer-jail/state
-$HOME/.devcontainer-jail/requests
+$HOME/.devcontainer-jail
 ```
 
-That directory is intended to survive container rebuilds, Docker restarts, and
-normal host reboots. Worker shell history and agent login state are also kept in
-Docker named volumes unless those volumes are explicitly removed.
+Set `DEVCONTAINER_JAIL_HOME` before launching VS Code if you want that state in
+a different location.
 
-To use a different host-owned state directory, set:
-
-```bash
-export DEVCONTAINER_JAIL_HOME=/tmp/my-devcontainer-jail
-```
-
-## Verification
+## Verify
 
 Inside the worker:
 
@@ -93,250 +41,126 @@ jail-hardening-check
 
 Expected result: every check prints `OK`.
 
-Quick network behavior check:
+To test egress approval:
 
 ```bash
 curl -I https://example.com
 ```
 
-Expected result before approval: denied by the egress proxy. For proxy-aware
-tools, the request is held while a pending operator request is open. If the
-operator denies, blocks, or the client times out first, the denial body includes
-the attempted host/port.
+Before approval, this creates a pending request and holds the client connection.
 
-## Host Operator
+## Operator
 
-The worker sends proxy-aware tools through:
-
-```text
-http://egress-proxy:8080
-```
-
-The proxy is default-deny. The worker can request access, but cannot approve it;
-host-side decisions happen in one TTY:
+Run the host operator from the project root:
 
 ```bash
 .devcontainer/host/jail-operator
 ```
 
-Default-denied proxy-aware HTTP/HTTPS attempts automatically create deduplicated
-pending operator requests. The proxy holds the client connection open while the
-operator decides. Approval lets the original request continue if the client has
-not timed out; denial returns `403` with the attempted target:
+Use it to approve, deny, revoke, change TTLs, inspect active SSH leases, manage
+the blacklist, and run the host SSH broker. It live-refreshes pending requests.
 
-```text
-HARDENED JAIL: egress denied
-Attempted: connect registry.npmjs.org:443
-```
+Pending requests support approve, deny, and forever-deny. Active approvals can
+be revoked or moved between finite TTLs and `forever`. Active SSH leases appear
+in the `leases` view with their TTLs and can be revoked there. Recent brokered
+SSH sessions appear in the `sessions` view.
 
-This is the primary low-noise path for agents: do not repeatedly retry blocked
-network commands; leave the request for the operator.
+## Network Access
 
-The operator live-refreshes pending requests and lets you approve, deny, review,
-revoke, and permanently block access from the same TTY. Use arrow keys to move,
-Page Up/Page Down or Space/`b` to page, Enter to show or hide details, `tab` to
-switch between pending requests, active approvals, blacklist, and SSH aliases,
-`s` to toggle timestamp/alphabetical sorting, and `q` to quit. The bottom help
-line changes per view: pending requests support approve/deny/forever-deny,
-approvals support TTL changes and revoke, blacklist supports unblock, and SSH
-aliases support add/remove/block. TTL choices include `forever` for durable
-approvals such as GitHub or agent APIs; these can be shortened or revoked later
-from the active approvals view.
+Proxy-aware network requests are default-deny. Unknown HTTP/HTTPS targets create
+or update one pending request per target. If approved before the client times
+out, the original request continues.
 
-Expired approvals are pruned from the policy when the operator refreshes, so
-they do not continue to populate the active approval list.
-
-Blacklist entries are enforced before approvals by the egress proxy and before
-SSH sessions by the operator. Blocked targets do not create repeat pending
-requests and are denied immediately.
-
-Unknown tools that ignore proxy settings should fail because the worker has no
-direct internet route. Those failures may be less descriptive than proxy-aware
-denials, but they are still blocked by the Docker network boundary.
-
-## Package Installs
-
-Direct package registry access is denied unless you approve egress. Prefer
-`pnpm` for Node projects and `uv` for Python projects when the project supports
-them. They are installed in the image.
-
-For package-manager work, run one command inside the worker:
+For package-manager work, run the install through `jailctl`:
 
 ```bash
 jailctl install --run pnpm install --frozen-lockfile
 jailctl install --run uv sync
-jailctl install --run cargo fetch
-```
-
-`--run` creates the request, waits for approval in the operator, then
-executes the package command in the same worker TTY. Use request-only mode when
-you want to approve first and run manually later:
-
-```bash
-jailctl install --wait pnpm install --frozen-lockfile
-```
-
-Fallbacks remain available for projects that already standardize on them:
-
-```bash
 jailctl install --run npm ci
-jailctl install --run pip install -r requirements.txt
+jailctl install --run uv pip install -r requirements.txt
 ```
 
-The request records the manager, arguments, current project, and lockfile
-hashes so the operator can approve a narrow egress window.
+`pnpm`, `uv`/`uvx`, Python venv support, Claude Code, Codex CLI, Graphify, GSD
+Core, Headroom, and Ponytail are installed in the worker image.
+
+Node/JavaScript tooling is enabled by default. `pnpm` and `uv` are the preferred
+package managers. Python, Go, Rust, and Playwright can be preinstalled at build
+time by editing `customizations.jail.buildArgs` in `.devcontainer/devcontainer.json`
+and rebuilding the devcontainer:
+
+```json
+"buildArgs": {
+  "ENABLE_PYTHON": "true",
+  "ENABLE_GO": "true",
+  "ENABLE_RUST": "true"
+}
+```
+
+Without those args, install them on demand inside the worker using `uv`, `go`
+tarballs, or `rustup`; user-installed tools live under the persisted
+`/home/node/.local` volume.
 
 ## Agent Login
 
-Run agent login inside the worker so the jail-owned Docker volumes hold the
-agent state:
+Run agent login inside the worker:
 
 ```bash
 jailctl agent-login codex
 jailctl agent-login claude
 ```
 
-The command creates a host approval request, waits for operator approval, and
-then launches the agent login command inside the container. The login UI runs in
-the worker terminal.
+Agent state is kept in jail-owned Docker volumes, not mounted from your host
+agent config directories.
 
-After login, use the tools normally:
+## Headroom
 
-```bash
-codex
-claude
-graphify --help
-gsd-tools --help
-headroom --help
-pnpm --version
-uv --version
-```
-
-## Headroom Proxy
-
-The worker starts Headroom automatically in a detached tmux session named
+Headroom starts automatically in a detached worker tmux session named
 `headroom`:
 
 ```bash
 tmux attach -t headroom
 ```
 
-It binds explicitly to `127.0.0.1:8787` inside the worker and writes JSONL logs
-to:
-
-```text
-/home/node/.local/share/headroom/proxy.jsonl
-```
-
-Interactive shells export these defaults:
-
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-OPENAI_BASE_URL=http://127.0.0.1:8787/v1
-```
-
-The proxy process itself is launched through `headroom-proxy`, which unsets
-those client-side base URL variables before starting Headroom so it does not
-accidentally route upstream calls back into itself.
-
-`host/jail-init` seeds exact-host, forever approvals for common agent endpoints
-once. They remain visible in the operator and can be shortened or revoked there;
-the seed marker prevents revoked defaults from being recreated on every init.
-
 ## Ponytail
 
-Ponytail is installed from `@dietrichgebert/ponytail`, but the container does
-not silently install or trust agent plugins. Install plugins from the agent UI
-or CLI so the enabled hooks are visible.
+Ponytail is installed, but plugins are not silently trusted. Install plugins
+from the agent UI or CLI.
 
-For Codex:
-
-```bash
-codex plugin marketplace add DietrichGebert/ponytail
-codex plugin add ponytail@ponytail
-```
-
-If hook trust is required, open `/hooks` in Codex and review it there.
-
-For Claude Code, send these as two separate prompts:
-
-```text
-/plugin marketplace add DietrichGebert/ponytail
-/plugin install ponytail@ponytail
-```
-
-Agent plugin state persists in the jail-owned Docker volumes mounted at
-`/home/node/.codex` and `/home/node/.claude`.
+If plugin installation needs GitHub, approve that egress request in the
+operator.
 
 ## SSH
 
-SSH keys stay on the host. The worker has no private keys and no raw `SSH_AUTH_SOCK`.
+SSH keys stay on the host. The worker has no private keys and no raw
+`SSH_AUTH_SOCK`.
 
-Manage SSH aliases from the operator's `ssh` view. Press `n` to add an alias,
-`r` to remove one, and `x` to move an alias to the blacklist. The shared
-blacklist view shows both egress blocks and SSH alias blocks; press `r` there to
-unblock. The underlying policy is stored at
-`$HOME/.devcontainer-jail/policy/ssh-allowlist.json`.
-
-Request SSH from inside the worker:
+Run the operator, then use SSH normally inside the worker:
 
 ```bash
-jailctl ssh staging-readonly
+ssh root@your-tailnet-node
+ssh git@github.com
 ```
 
-This writes a request. Approving it in the operator opens the actual SSH process
-in the operator terminal on the host, using host keys.
+The first matching invocation creates a pending SSH request. If approved, the
+host broker runs real host SSH and relays stdin/stdout/stderr back to the jailed
+process. Git uses the same path through `GIT_SSH=/usr/local/bin/ssh`.
 
-For scoped lease approval from one worker shell/session:
+For scoped lease approval:
 
 ```bash
 jailctl ssh-lease staging-readonly --ttl 30m --wait
+jailctl ssh-lease root@100.75.201.20 --ttl 4h --wait
 ```
 
-Raw SSH targets such as `user@host` are blocked by the worker `ssh` wrapper.
+Forwarding and proxy-style SSH features are intentionally denied by the broker.
 
-Current limitation: SSH is brokered through the operator, not transparently
-tunneled. `git fetch` over SSH inside the worker is not automatically bridged
-yet. Prefer HTTPS remotes inside the jail, or open host-side SSH sessions
-through the operator.
+## Browser Bridge
 
-## Optional Browser Bridge
-
-The host Chrome bridge is configured in:
-
-```text
-.devcontainer/host/chrome-bridge.env
-```
-
+The optional host Chrome bridge is configured in
+`customizations.jail.hostChrome` in `.devcontainer/devcontainer.json`.
 By default it starts on macOS during devcontainer initialization when `open`,
-`lsof`, and Google Chrome are available. Disable or adjust it by editing that
-file:
-
-```env
-HOST_CHROME_ENABLED=true
-CHROME_REMOTE_PORT=9222
-CHROME_REMOTE_BIND=127.0.0.1
-CHROME_REMOTE_PROFILE="$HOME/.chrome-remote-test"
-```
-
-It uses a dedicated test profile:
+`lsof`, and Google Chrome are available. It uses the dedicated profile:
 
 ```text
 $HOME/.chrome-remote-test
 ```
-
-It binds Chrome DevTools Protocol to `127.0.0.1` by default. Keep this profile for test-app auth only; do not use your personal Chrome profile for agent-driven browser automation.
-
-## File Map
-
-- [devcontainer.json](devcontainer.json): VS Code entrypoint.
-- [docker-compose.yml](docker-compose.yml): worker plus egress proxy topology.
-- [Dockerfile](Dockerfile): locked-down worker image.
-- [Dockerfile.proxy](Dockerfile.proxy): default-deny egress proxy image.
-- [scripts/jailctl](scripts/jailctl): worker-side request CLI.
-- [scripts/egress-proxy.py](scripts/egress-proxy.py): proxy enforcement.
-- [scripts/jail-hardening-check](scripts/jail-hardening-check): in-worker validation.
-- [scripts/headroom-proxy](scripts/headroom-proxy): worker-local Headroom proxy launcher.
-- [scripts/jail-start](scripts/jail-start): worker startup script.
-- [host/jail-init](host/jail-init): host state initializer.
-- [host/jail-operator](host/jail-operator): interactive host approval TUI.

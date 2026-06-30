@@ -36,6 +36,24 @@ else
   check_ok "SSH agent socket absent"
 fi
 
+if [[ -r /jail-ssh-broker-token && -n "${JAIL_SSH_BROKER_HOST:-}" && -n "${JAIL_SSH_BROKER_PORT:-}" ]]; then
+  check_ok "SSH broker configuration is mounted"
+else
+  check_fail "SSH broker configuration is missing"
+fi
+
+if [[ "$(command -v ssh)" == "/usr/local/bin/ssh" && "$(readlink -f /usr/bin/ssh 2>/dev/null || true)" == "/usr/local/bin/ssh" ]]; then
+  check_ok "SSH resolves to the broker shim"
+else
+  check_fail "SSH does not resolve to the broker shim"
+fi
+
+if [[ ! -x /usr/bin/ssh.real ]]; then
+  check_ok "raw OpenSSH client is not directly executable"
+else
+  check_fail "raw OpenSSH client remains directly executable"
+fi
+
 if find "$HOME/.ssh" -maxdepth 1 -type f \( -name 'id_*' ! -name '*.pub' \) 2>/dev/null | grep -q .; then
   check_fail "SSH private key exists in home"
 else
@@ -46,6 +64,12 @@ if [[ -d "$HOME/.claude" && -d "$HOME/.codex" && -d "$HOME/.agents" ]]; then
   check_ok "agent state directories are available inside the jail"
 else
   check_fail "agent state directories are missing"
+fi
+
+if [[ -L "$HOME/.claude.json" && -d "$HOME/.claude-home" && -w "$HOME/.claude-home" ]]; then
+  check_ok "Claude home-level state is persisted through a writable volume"
+else
+  check_fail "Claude home-level state is not persisted"
 fi
 
 if [[ -e /policy/approvals.json || -e "$HOME/.devcontainer-jail/policy/approvals.json" ]]; then
@@ -78,6 +102,93 @@ if [[ "${HTTP_PROXY:-}" == "http://egress-proxy:8080" && "${HTTPS_PROXY:-}" == "
 else
   check_fail "proxy environment is not configured for egress-proxy"
 fi
+
+pnpm_global_bin="${PNPM_HOME:-$HOME/.local/share/pnpm}/bin"
+case ":$PATH:" in
+  *":$pnpm_global_bin:"*|*":${PNPM_HOME:-$HOME/.local/share/pnpm}:"*)
+    check_ok "pnpm global bin location is on PATH"
+    ;;
+  *)
+    check_fail "pnpm global bin location is missing from PATH: ${PNPM_HOME:-$HOME/.local/share/pnpm}"
+    ;;
+esac
+
+npm_global_bin="${NPM_CONFIG_PREFIX:-$HOME/.local}/bin"
+case ":$PATH:" in
+  *":$npm_global_bin:"*)
+    check_ok "npm global bin directory is on PATH"
+    ;;
+  *)
+    check_fail "npm global bin directory is missing from PATH: $npm_global_bin"
+    ;;
+esac
+
+if [[ "${NPM_CONFIG_PREFIX:-}" == "$HOME/.local" && -w "${NPM_CONFIG_PREFIX:-}" ]]; then
+  check_ok "npm global prefix is writable"
+else
+  check_fail "npm global prefix is not writable: ${NPM_CONFIG_PREFIX:-unset}"
+fi
+
+if [[ "${PLAYWRIGHT_BROWSERS_PATH:-}" == "$HOME/.local/share/ms-playwright" && -w "${PLAYWRIGHT_BROWSERS_PATH:-}" ]]; then
+  check_ok "Playwright browser path is writable under executable user-local storage"
+else
+  check_fail "Playwright browser path is not configured for executable user-local storage: ${PLAYWRIGHT_BROWSERS_PATH:-unset}"
+fi
+
+if command -v uv >/dev/null 2>&1 && command -v uvx >/dev/null 2>&1; then
+  check_ok "uv and uvx are available"
+else
+  check_fail "uv or uvx is missing"
+fi
+
+if [[ "${UV_CACHE_DIR:-}" == "$HOME/.local/cache/uv" && -w "${UV_CACHE_DIR:-}" ]]; then
+  check_ok "uv cache directory is writable under executable user-local storage"
+else
+  check_fail "uv cache directory is not configured for executable user-local storage: ${UV_CACHE_DIR:-unset}"
+fi
+
+if [[ "${UV_PYTHON_INSTALL_DIR:-}" == "$HOME/.local/share/uv/python" && -w "${UV_PYTHON_INSTALL_DIR:-}" ]]; then
+  check_ok "uv-managed Python install directory is writable"
+else
+  check_fail "uv-managed Python install directory is not writable: ${UV_PYTHON_INSTALL_DIR:-unset}"
+fi
+
+if [[ "${UV_PYTHON_BIN_DIR:-}" == "$HOME/.local/bin" && "${UV_TOOL_BIN_DIR:-}" == "$HOME/.local/bin" ]]; then
+  check_ok "uv executable bin directories point at user-local bin"
+else
+  check_fail "uv executable bin directories are not configured for user-local bin"
+fi
+
+for manager_bin in "${GOPATH:-$HOME/.local/share/go}/bin" "${CARGO_HOME:-$HOME/.local/share/cargo}/bin"; do
+  case ":$PATH:" in
+    *":$manager_bin:"*)
+      check_ok "$manager_bin is on PATH"
+      ;;
+    *)
+      check_fail "$manager_bin is missing from PATH"
+      ;;
+  esac
+done
+
+if [[ -d "${RUSTUP_HOME:-$HOME/.local/share/rustup}" && -w "${RUSTUP_HOME:-$HOME/.local/share/rustup}" ]]; then
+  check_ok "rustup home is writable"
+else
+  check_fail "rustup home is not writable"
+fi
+
+if [[ -d "${TMPDIR:-$HOME/.local/tmp}" && -w "${TMPDIR:-$HOME/.local/tmp}" ]]; then
+  check_ok "TMPDIR is writable for installers"
+else
+  check_fail "TMPDIR is not writable for installers"
+fi
+
+exec_probe="$HOME/.local/.exec-probe-$$"
+if printf '#!/bin/sh\nexit 0\n' > "$exec_probe" && chmod 700 "$exec_probe" && "$exec_probe"; then
+  check_ok "$HOME/.local allows user-installed executables"
+else
+  check_fail "$HOME/.local is not executable; package-manager installed tools will fail"
+fi
+rm -f "$exec_probe"
 
 if find / -xdev -perm /6000 -type f 2>/dev/null | grep -q .; then
   check_fail "setuid/setgid files remain in root filesystem"

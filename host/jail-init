@@ -3,6 +3,15 @@ set -euo pipefail
 
 base="${DEVCONTAINER_JAIL_HOME:-$HOME/.devcontainer-jail}"
 mkdir -p "$base/policy" "$base/policy/ssh-leases" "$base/state" "$base/requests"
+token_file="$base/state/ssh-broker-token"
+
+if [[ ! -f "$token_file" ]]; then
+  umask 077
+  python3 - <<'PY' > "$token_file"
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+fi
 
 if [[ ! -f "$base/policy/approvals.json" ]]; then
   cat > "$base/policy/approvals.json" <<'JSON'
@@ -80,8 +89,10 @@ chmod 700 "$base" "$base/policy" "$base/state"
 chmod 755 "$base/policy/ssh-leases"
 chmod 1777 "$base/requests"
 chmod 600 "$base/policy/approvals.json" "$base/policy/ssh-allowlist.json"
+chmod 600 "$token_file"
 
 printf 'initialized hardened jail state at %s\n' "$base"
 printf 'export JAIL_POLICY_DIR=%s/policy\n' "$base"
 printf 'export JAIL_STATE_DIR=%s/state\n' "$base"
 printf 'export JAIL_REQUEST_DIR=%s/requests\n' "$base"
+printf 'export JAIL_SSH_BROKER_TOKEN_FILE=%s\n' "$token_file"

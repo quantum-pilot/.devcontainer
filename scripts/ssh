@@ -1,39 +1,363 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+import json
+import os
+import select
+import shlex
+import signal
+import socket
+import struct
+import sys
+import termios
+import tty
 
-if [[ $# -eq 0 ]]; then
-  exec /usr/bin/ssh "$@"
-fi
 
-target=""
-remote=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -*)
-      printf 'ssh wrapper: direct ssh options are blocked in the jail; use an approved alias\n' >&2
-      exit 126
-      ;;
-    *)
-      target="$1"
-      shift
-      remote=("$@")
-      break
-      ;;
-  esac
-done
+BROKER_HOST = os.environ.get("JAIL_SSH_BROKER_HOST", "host.docker.internal")
+BROKER_PORT = int(os.environ.get("JAIL_SSH_BROKER_PORT", "8822"))
+TOKEN_FILE = os.environ.get("JAIL_SSH_BROKER_TOKEN_FILE", "/jail-ssh-broker-token")
+FRAME_STDIN = 0
+FRAME_STDOUT = 1
+FRAME_STDERR = 2
+FRAME_EXIT = 3
+FRAME_STDIN_EOF = 4
+FRAME_RESIZE = 5
 
-if [[ -z "$target" ]]; then
-  printf 'ssh wrapper: missing alias\n' >&2
-  exit 2
-fi
+RISKY_SHORT_WITH_ARG = {"-L", "-R", "-D", "-W", "-J"}
+RISKY_SHORT_FLAGS = set("AXYf")
+SHORT_ARG_OPTIONS = {"-p", "-l", "-o", "-F", "-b", "-c", "-m", "-e"}
+SAFE_SHORT_FLAGS = set("46CqvVnNTtsxak")
+RISKY_OPTION_KEYS = {
+    "clearallforwardings",
+    "dynamicforward",
+    "exitonforwardfailure",
+    "forwardagent",
+    "forwardx11",
+    "forwardx11trusted",
+    "identityagent",
+    "localcommand",
+    "localforward",
+    "permitlocalcommand",
+    "proxycommand",
+    "proxyjump",
+    "remotecommand",
+    "remoteforward",
+    "sessiontype",
+    "stdioforwardhost",
+    "stdioforwardport",
+}
 
-if [[ "$target" == *@* || "$target" == *:* || "$target" == *.* ]]; then
-  printf 'ssh wrapper: raw SSH targets are blocked; use an approved alias such as `ssh staging-readonly`\n' >&2
-  exit 126
-fi
 
-if [[ ${#remote[@]} -gt 0 ]]; then
-  exec jailctl ssh "$target" --command "${remote[*]}"
-fi
+class SSHUsageError(Exception):
+    pass
 
-exec jailctl ssh "$target"
+
+def die(message, status=255):
+    print(f"ssh broker shim: {message}", file=sys.stderr)
+    return status
+
+
+def read_token():
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError as exc:
+        raise SSHUsageError(f"cannot read broker token at {TOKEN_FILE}: {exc}") from exc
+
+
+def process_tree():
+    tree = []
+    pid = os.getpid()
+    while pid > 1:
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as fh:
+                stat = fh.read().split()
+            ppid = int(stat[3])
+            comm = stat[1].strip("()")
+            starttime = stat[21]
+        except (OSError, IndexError, ValueError):
+            break
+        tree.append({"pid": pid, "comm": comm, "starttime": starttime})
+        pid = ppid
+    return tree
+
+
+def session_scope():
+    return {
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "sid": os.getsid(0),
+        "pgid": os.getpgrp(),
+        "uid": os.getuid(),
+        "tree": process_tree(),
+    }
+
+
+def split_ssh_target(target, user, port):
+    if "@" in target:
+        target_user, target_host = target.rsplit("@", 1)
+        user = user or target_user
+    else:
+        target_host = target
+    if target_host.startswith("["):
+        host, _, rest = target_host[1:].partition("]")
+        if rest.startswith(":") and rest[1:].isdigit():
+            port = int(rest[1:])
+        target_host = host
+    elif ":" in target_host and target_host.rsplit(":", 1)[1].isdigit():
+        target_host, port_text = target_host.rsplit(":", 1)
+        port = int(port_text)
+    return user, target_host, int(port)
+
+
+def looks_like_direct_target(target):
+    return "@" in target or "." in target or ":" in target or target.startswith("[")
+
+
+def option_key(raw):
+    key = raw.split("=", 1)[0].strip().lower()
+    return key.replace("-", "")
+
+
+def validate_o_option(raw):
+    if option_key(raw) in RISKY_OPTION_KEYS:
+        raise SSHUsageError(f"unsupported unsafe -o option: {raw}")
+
+
+def take_option_arg(argv, index, option):
+    arg = argv[index]
+    if arg == option:
+        if index + 1 >= len(argv):
+            raise SSHUsageError(f"{option} requires an argument")
+        return argv[index + 1], index + 2
+    return arg[2:], index + 1
+
+
+def parse_argv(argv):
+    if argv == ["-V"]:
+        print("OpenSSH broker shim")
+        raise SystemExit(0)
+    if not argv:
+        raise SSHUsageError("missing target")
+    safe_options = []
+    user = ""
+    port = 22
+    target = ""
+    remote_args = []
+    tty_mode = "auto"
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            index += 1
+            break
+        if not arg.startswith("-") or arg == "-":
+            break
+        if arg in RISKY_SHORT_WITH_ARG:
+            raise SSHUsageError(f"unsupported unsafe SSH option: {arg}")
+        if any(flag in RISKY_SHORT_FLAGS for flag in arg[1:]):
+            raise SSHUsageError(f"unsupported unsafe SSH option: {arg}")
+        if arg == "-i" or arg.startswith("-i"):
+            raise SSHUsageError("-i is host-side policy; add an SSH alias with an identity file in the operator")
+        if arg == "-S" or arg.startswith("-S"):
+            raise SSHUsageError("SSH control sockets are not supported through the broker")
+        matched_arg_option = next((opt for opt in SHORT_ARG_OPTIONS if arg == opt or (arg.startswith(opt) and len(arg) > 2)), "")
+        if matched_arg_option:
+            value, index = take_option_arg(argv, index, matched_arg_option)
+            if matched_arg_option == "-p":
+                port = int(value)
+            elif matched_arg_option == "-l":
+                user = value
+            elif matched_arg_option == "-o":
+                validate_o_option(value)
+                safe_options.extend(["-o", value])
+            elif matched_arg_option == "-F":
+                if value not in {"none", "/dev/null"}:
+                    raise SSHUsageError("-F may only be none or /dev/null inside the jail")
+                safe_options.extend(["-F", value])
+            else:
+                safe_options.extend([matched_arg_option, value])
+            continue
+        for flag in arg[1:]:
+            if flag not in SAFE_SHORT_FLAGS:
+                raise SSHUsageError(f"unsupported SSH option: -{flag}")
+            if flag == "T":
+                tty_mode = "disable"
+            elif flag == "t":
+                tty_mode = "force"
+        safe_options.append(arg)
+        index += 1
+    if index >= len(argv):
+        raise SSHUsageError("missing target")
+    target = argv[index]
+    remote_args = argv[index + 1:]
+    payload = {
+        "target": target,
+        "remote_args": remote_args,
+        "remote_command": shlex.join(remote_args) if remote_args else "",
+        "ssh_options": safe_options,
+        "tty_mode": tty_mode,
+        "scope": session_scope(),
+        "cwd": os.getcwd(),
+        "ttl": os.environ.get("JAIL_SSH_DEFAULT_TTL", "30m"),
+        "features": {
+            "agent_forwarding": False,
+            "x11_forwarding": False,
+            "port_forwarding": False,
+        },
+    }
+    if looks_like_direct_target(target):
+        user, host, port = split_ssh_target(target, user, port)
+        if not host:
+            raise SSHUsageError("missing target host")
+        payload.update({
+            "host": host,
+            "user": user,
+            "port": port,
+            "target_key": f"{user + '@' if user else ''}{host}:{port}",
+        })
+    else:
+        payload.update({
+            "alias": target,
+            "target_key": target,
+        })
+    return payload
+
+
+def winsize():
+    try:
+        rows, cols = os.get_terminal_size(sys.stdin.fileno())
+        return {"rows": rows, "cols": cols}
+    except OSError:
+        return {"rows": 24, "cols": 80}
+
+
+def frame_send(sock, channel, data):
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    sock.sendall(struct.pack(">BI", channel, len(data)) + data)
+
+
+def recv_exact(sock, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            if chunks:
+                raise EOFError("short frame read")
+            return b""
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def frame_recv(sock):
+    header = recv_exact(sock, 5)
+    if not header:
+        return None, b""
+    channel, length = struct.unpack(">BI", header)
+    return channel, recv_exact(sock, length)
+
+
+def set_raw(fd):
+    if not os.isatty(fd):
+        return None
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    return old
+
+
+def restore(fd, old):
+    if old is not None:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def relay(sock, interactive):
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    stderr_fd = sys.stderr.fileno()
+    old_term = set_raw(stdin_fd) if interactive else None
+    exit_status = 1
+    got_exit = False
+    resize_pending = False
+
+    def on_winch(_signum, _frame):
+        nonlocal resize_pending
+        resize_pending = True
+
+    previous_winch = signal.getsignal(signal.SIGWINCH)
+    if interactive:
+        signal.signal(signal.SIGWINCH, on_winch)
+    try:
+        while True:
+            if resize_pending:
+                frame_send(sock, FRAME_RESIZE, json.dumps(winsize()))
+                resize_pending = False
+            readers = [sock]
+            if stdin_fd is not None:
+                readers.append(stdin_fd)
+            readable, _, _ = select.select(readers, [], [], 0.25)
+            if stdin_fd in readable:
+                data = os.read(stdin_fd, 32768)
+                if data:
+                    frame_send(sock, FRAME_STDIN, data)
+                else:
+                    frame_send(sock, FRAME_STDIN_EOF, b"")
+                    stdin_fd = None
+            if sock in readable:
+                channel, data = frame_recv(sock)
+                if channel is None:
+                    if not got_exit:
+                        os.write(
+                            stderr_fd,
+                            (
+                                "ssh broker shim: broker closed before SSH exit status; "
+                                "restart the host operator and rebuild/reopen the devcontainer if this persists\n"
+                            ).encode("utf-8"),
+                        )
+                    break
+                if channel == FRAME_STDOUT:
+                    os.write(stdout_fd, data)
+                elif channel == FRAME_STDERR:
+                    os.write(stderr_fd, data)
+                elif channel == FRAME_EXIT:
+                    got_exit = True
+                    try:
+                        exit_status = int(json.loads(data.decode("utf-8")).get("exit_status", 1))
+                    except (ValueError, json.JSONDecodeError):
+                        exit_status = 1
+                    break
+    finally:
+        restore(sys.stdin.fileno(), old_term)
+        if interactive:
+            signal.signal(signal.SIGWINCH, previous_winch)
+    return exit_status
+
+
+def main(argv):
+    try:
+        payload = parse_argv(argv)
+        token = read_token()
+    except (SSHUsageError, ValueError) as exc:
+        return die(str(exc))
+    request = {
+        "version": 1,
+        "kind": "ssh",
+        "token": token,
+        "payload": payload,
+        "tty": os.isatty(sys.stdin.fileno()),
+        "term": os.environ.get("TERM", "xterm-256color"),
+        "winsize": winsize(),
+    }
+    try:
+        with socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=10) as sock:
+            sock.sendall(json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n")
+            return relay(sock, bool(request["tty"]))
+    except OSError as exc:
+        return die(f"cannot connect to host SSH broker at {BROKER_HOST}:{BROKER_PORT}: {exc}")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
