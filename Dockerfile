@@ -157,6 +157,8 @@ RUN mkdir -p \
     'export COLORTERM="${COLORTERM:-truecolor}"' \
     'export HEADROOM_HOST=127.0.0.1' \
     'export HEADROOM_PORT=8787' \
+    'export JAIL_HEADROOM_TMUX_SESSION="${JAIL_HEADROOM_TMUX_SESSION:-headroom}"' \
+    'export JAIL_MANAGED_TMUX_SESSIONS="${JAIL_MANAGED_TMUX_SESSIONS:-$JAIL_HEADROOM_TMUX_SESSION}"' \
     'export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.local}"' \
     'export PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"' \
     'export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.local/share/ms-playwright}"' \
@@ -174,7 +176,7 @@ RUN mkdir -p \
     'export ANTHROPIC_BASE_URL="http://${HEADROOM_HOST}:${HEADROOM_PORT}"' \
     'export OPENAI_BASE_URL="http://${HEADROOM_HOST}:${HEADROOM_PORT}/v1"' \
     'export GIT_SSH=/usr/local/bin/ssh' \
-    'alias headroom-attach="tmux attach -t headroom"' \
+    'alias headroom-attach="tmux attach -t =$JAIL_HEADROOM_TMUX_SESSION"' \
     'bindkey -e' \
     'bindkey "^[[1;5D" backward-word' \
     'bindkey "^[[1;5C" forward-word' \
@@ -200,6 +202,8 @@ RUN mkdir -p \
     'export COLORTERM="${COLORTERM:-truecolor}"' \
     'export HEADROOM_HOST=127.0.0.1' \
     'export HEADROOM_PORT=8787' \
+    'export JAIL_HEADROOM_TMUX_SESSION="${JAIL_HEADROOM_TMUX_SESSION:-headroom}"' \
+    'export JAIL_MANAGED_TMUX_SESSIONS="${JAIL_MANAGED_TMUX_SESSIONS:-$JAIL_HEADROOM_TMUX_SESSION}"' \
     'export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.local}"' \
     'export PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"' \
     'export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.local/share/ms-playwright}"' \
@@ -217,7 +221,7 @@ RUN mkdir -p \
     'export ANTHROPIC_BASE_URL="http://${HEADROOM_HOST}:${HEADROOM_PORT}"' \
     'export OPENAI_BASE_URL="http://${HEADROOM_HOST}:${HEADROOM_PORT}/v1"' \
     'export GIT_SSH=/usr/local/bin/ssh' \
-    'alias headroom-attach="tmux attach -t headroom"' \
+    'alias headroom-attach="tmux attach -t =$JAIL_HEADROOM_TMUX_SESSION"' \
     'PS1="\u@jail:\w$ "' \
     > /home/${USERNAME}/.bashrc \
   && printf '%s\n' \
@@ -245,12 +249,14 @@ COPY scripts/ssh /usr/local/bin/ssh
 COPY scripts/headroom-proxy /usr/local/bin/headroom-proxy
 COPY scripts/jail-start /usr/local/bin/jail-start
 COPY scripts/jail-hardening-check /usr/local/bin/jail-hardening-check
+COPY scripts/jail-tmux /usr/local/bin/jail-tmux
 RUN chmod 0755 \
   /usr/local/bin/jailctl \
   /usr/local/bin/ssh \
   /usr/local/bin/headroom-proxy \
   /usr/local/bin/jail-start \
-  /usr/local/bin/jail-hardening-check
+  /usr/local/bin/jail-hardening-check \
+  /usr/local/bin/jail-tmux
 
 RUN set -eux; \
   if [ -x /usr/bin/ssh ] && [ ! -e /usr/bin/ssh.real ]; then \

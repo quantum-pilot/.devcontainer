@@ -35,6 +35,8 @@ services:
       npm_config_proxy: http://egress-proxy:8080
       npm_config_https_proxy: http://egress-proxy:8080
       GIT_SSH: /usr/local/bin/ssh
+      JAIL_HEADROOM_TMUX_SESSION: headroom
+      JAIL_MANAGED_TMUX_SESSIONS: headroom
       JAIL_SSH_BROKER_HOST: ssh-broker-proxy
       JAIL_SSH_BROKER_PORT: "8822"
       JAIL_SSH_BROKER_TOKEN_FILE: /jail-ssh-broker-token

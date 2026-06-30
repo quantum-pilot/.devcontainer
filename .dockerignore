@@ -1,6 +1,7 @@
 .git
 .gitignore
 .env
+.jail/
 *.log
 __pycache__/
 *.pyc

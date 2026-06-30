@@ -115,11 +115,27 @@ agent config directories.
 ## Headroom
 
 Headroom starts automatically in a detached worker tmux session named
-`headroom`:
+by `JAIL_HEADROOM_TMUX_SESSION`:
 
 ```bash
-tmux attach -t headroom
+headroom-attach
 ```
+
+## tmux Layouts
+
+Rebuilds recreate containers and kill running tmux processes. Save and restore
+the layout with:
+
+```bash
+jail-tmux snapshot
+jail-tmux restore
+```
+
+The snapshot is stored at `.devcontainer/.jail/tmux-layout.json`. It includes
+all tmux sessions, windows, panes, working directories, and best-effort pane
+commands, except managed sessions listed in `JAIL_MANAGED_TMUX_SESSIONS`, which
+are started automatically.
+Edit a pane's `command` field before restore when needed.
 
 ## Ponytail
 

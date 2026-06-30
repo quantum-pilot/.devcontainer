@@ -206,8 +206,16 @@ Because `/home/node` is read-only, the image creates:
 
 ## Headroom
 
-`jail-start` starts `headroom-proxy` in a detached tmux session named
-`headroom` when both `tmux` and `headroom` are available.
+`jail-start` starts `headroom-proxy` in a detached tmux session named by
+`JAIL_HEADROOM_TMUX_SESSION` when both `tmux` and `headroom` are available.
+
+`jail-tmux snapshot` records all tmux sessions into
+`.devcontainer/.jail/tmux-layout.json`. `jail-tmux restore` recreates all
+sessions, windows, panes, working directories, active selections, and configured
+pane commands. Managed sessions listed in `JAIL_MANAGED_TMUX_SESSIONS` are
+ignored because runtime startup recreates them automatically. Commands are
+captured from `/proc` argv on a best-effort basis; users can edit each pane's
+`command` field before restore.
 
 The proxy binds inside the worker at:
 

@@ -33,14 +33,17 @@ BROKER_BIND = os.environ.get("JAIL_SSH_BROKER_BIND", "0.0.0.0")
 BROKER_PORT = int(os.environ.get("JAIL_SSH_BROKER_PORT", "8822"))
 TTL_CHOICES = ["5m", "10m", "30m", "1h", "4h", "forever"]
 REFRESH_MS = 1000
-SORT_CHOICES = ["time", "alpha"]
 VIEW_CHOICES = ["pending", "leases", "sessions", "approvals", "blacklist"]
+AREA_VIEWS = {
+    "egress": ["pending", "approvals", "blacklist"],
+    "ssh": ["pending", "leases", "sessions", "blacklist"],
+}
 VIEW_COLOR_PAIR_BASE = 20
 VIEW_COLOR_SPECS = {
     "pending": (curses.COLOR_WHITE, curses.COLOR_BLUE),
     "leases": (curses.COLOR_BLACK, curses.COLOR_GREEN),
     "sessions": (curses.COLOR_WHITE, curses.COLOR_MAGENTA),
-    "approvals": (curses.COLOR_BLACK, curses.COLOR_CYAN),
+    "approvals": (curses.COLOR_BLACK, curses.COLOR_GREEN),
     "blacklist": (curses.COLOR_WHITE, curses.COLOR_RED),
 }
 BROKER_STATUS = "ssh broker: starting"
@@ -257,7 +260,7 @@ def session_recent(session, now):
     return (now - latest).total_seconds() <= SSH_SESSION_HISTORY_SECONDS
 
 
-def active_ssh_sessions(sort_mode):
+def active_ssh_sessions():
     now = utc_now()
     with SSH_SESSIONS_LOCK:
         old_ids = [
@@ -268,10 +271,7 @@ def active_ssh_sessions(sort_mode):
         for session_id in old_ids:
             SSH_SESSIONS.pop(session_id, None)
         rows = [(session_id, dict(session)) for session_id, session in SSH_SESSIONS.items()]
-    if sort_mode == "alpha":
-        rows.sort(key=lambda item: f"{item[1].get('target', '')} {item[1].get('command', '')}".lower())
-    else:
-        rows.sort(key=lambda item: parse_time(item[1].get("started_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
+    rows.sort(key=lambda item: parse_time(item[1].get("started_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
     return rows
 
 
@@ -300,7 +300,7 @@ def prune_expired_ssh_leases():
     return removed
 
 
-def active_ssh_leases(sort_mode):
+def active_ssh_leases():
     now = utc_now()
     rows = []
     for path in LEASE_DIR.glob("*.json"):
@@ -311,10 +311,7 @@ def active_ssh_leases(sort_mode):
         if expires_at and now >= expires_at:
             continue
         rows.append((path, lease))
-    if sort_mode == "alpha":
-        rows.sort(key=lambda item: ssh_lease_target(item[1]).lower())
-    else:
-        rows.sort(key=lambda item: ssh_lease_created(item[1]), reverse=True)
+    rows.sort(key=lambda item: ssh_lease_created(item[1]), reverse=True)
     return rows
 
 
@@ -513,7 +510,7 @@ def prune_expired_approvals():
     return removed
 
 
-def active_approvals(sort_mode):
+def active_approvals():
     prune_expired_approvals()
     rows = []
     for idx, rule in enumerate(load_approvals().get("rules", [])):
@@ -525,14 +522,11 @@ def active_approvals(sort_mode):
         if expires_at and expires_at <= utc_now():
             continue
         rows.append((idx, rule))
-    if sort_mode == "alpha":
-        rows.sort(key=lambda item: approval_sort_text(item[1]))
-    else:
-        rows.sort(key=lambda item: approval_time(item[1]), reverse=True)
+    rows.sort(key=lambda item: approval_time(item[1]), reverse=True)
     return rows
 
 
-def active_blacklist(sort_mode):
+def active_blacklist():
     rows = []
     for idx, rule in enumerate(load_approvals().get("blocks", [])):
         if not isinstance(rule, dict):
@@ -545,10 +539,7 @@ def active_blacklist(sort_mode):
             entry = {"alias": alias}
         entry.setdefault("alias", alias)
         rows.append(("ssh", alias, entry))
-    if sort_mode == "alpha":
-        rows.sort(key=lambda item: blacklist_sort_text(item[0], item[2]))
-    else:
-        rows.sort(key=lambda item: blacklist_time(item[0], item[2]), reverse=True)
+    rows.sort(key=lambda item: blacklist_time(item[0], item[2]), reverse=True)
     return rows
 
 
@@ -566,23 +557,9 @@ def blacklist_time(kind, entry):
     return block_time(entry)
 
 
-def approval_sort_text(rule):
-    label = rule.get("name") or rule.get("host") or rule.get("host_suffix") or rule.get("host_glob") or ""
-    return f"{label}:{rule.get('port', '')}".lower()
-
-
-def blacklist_sort_text(kind, entry):
-    if kind == "ssh":
-        return f"ssh:{entry.get('alias', '')}:{entry.get('host', '')}".lower()
-    return f"egress:{approval_sort_text(entry)}"
-
-
-def active_ssh_aliases(sort_mode):
+def active_ssh_aliases():
     rows = list(load_ssh_allowlist().items())
-    if sort_mode == "alpha":
-        rows.sort(key=lambda item: item[0].lower())
-    else:
-        rows.sort(key=lambda item: parse_time(item[1].get("updated_at") or item[1].get("created_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
+    rows.sort(key=lambda item: parse_time(item[1].get("updated_at") or item[1].get("created_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
     return rows
 
 
@@ -639,11 +616,7 @@ def request_sort_time(request):
     return parse_time(request.get("last_seen_at") or request.get("created_at") or "") or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
 
 
-def request_sort_text(path, request):
-    return f"{summarize(request)} {request.get('last_seen_at') or request.get('created_at', '')} {request.get('id', '')}".lower()
-
-
-def request_files(sort_mode):
+def request_files():
     found = []
     for path in REQUEST_DIR.glob("*.json"):
         request = read_json(path)
@@ -652,8 +625,6 @@ def request_files(sort_mode):
         if request.get("status", "pending") != "pending":
             continue
         found.append((path, request))
-    if sort_mode == "alpha":
-        return sorted(found, key=lambda item: request_sort_text(item[0], item[1]))
     return sorted(found, key=lambda item: request_sort_time(item[1]), reverse=True)
 
 
@@ -661,7 +632,7 @@ def summarize(request):
     kind = request.get("kind", "?")
     payload = request.get("payload", {})
     if kind == "egress":
-        return f"egress {payload.get('host', '?')}:{payload.get('port', 443)} {','.join(payload.get('protocols') or [])}"
+        return f"egress {payload.get('host', '?')}:{payload.get('port', 443)}"
     if kind == "install":
         args = " ".join(payload.get("arguments") or [])
         return f"install {payload.get('manager', '?')} {args}".strip()
@@ -1374,6 +1345,20 @@ def draw_full_width_text(win, y, text, attr=0):
     win.addnstr(y, 0, text.ljust(max(0, width - 1)), max(0, width - 1), attr)
 
 
+def draw_area_hint(win, area):
+    height, width = win.getmaxyx()
+    if height <= 0 or width < 24:
+        return
+    text = " e egress  s ssh "
+    x = max(0, width - len(text) - 1)
+    attr = curses.A_REVERSE | curses.A_BOLD
+    draw_text(win, 0, x, text, attr)
+    marker = "egress" if area == "egress" else "ssh"
+    marker_x = x + text.find(marker)
+    if marker_x >= x:
+        draw_text(win, 0, marker_x, marker, attr | curses.A_UNDERLINE)
+
+
 def init_view_colors():
     if not curses.has_colors():
         return False
@@ -1397,6 +1382,140 @@ def view_header_attr(view, color_enabled):
     return curses.color_pair(VIEW_COLOR_PAIR_BASE + VIEW_CHOICES.index(view)) | curses.A_BOLD
 
 
+def request_area(request):
+    return "ssh" if request.get("kind") in {"ssh", "ssh-lease"} else "egress"
+
+
+def row_time(value):
+    return timestamp_label(value) or "NO_TIMESTAMP"
+
+
+def fit_cell(value, width, align="left"):
+    text = str(value or "")
+    if width <= 0:
+        return ""
+    if len(text) > width:
+        return text[: max(0, width - 1)] + "~" if width > 1 else text[:1]
+    if align == "right":
+        return text.rjust(width)
+    return text.ljust(width)
+
+
+def compact_reason(value):
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if lowered.startswith("auto request after denied connect"):
+        return "AUTO_DENIED_CONNECT"
+    if lowered.startswith("auto request after denied http"):
+        return "AUTO_DENIED_HTTP"
+    if lowered == "default agent/headroom endpoint":
+        return "DEFAULT_AGENT_HEADROOM"
+    if lowered == "denied by host operator":
+        return "OPERATOR_DENIED"
+    if lowered == "blocked by host operator":
+        return "OPERATOR_BLOCKED"
+    if text.isupper() and all(char.isalnum() or char == "_" for char in text):
+        return text
+    cleaned = []
+    previous_underscore = False
+    for char in text.upper():
+        if char.isalnum():
+            cleaned.append(char)
+            previous_underscore = False
+        elif not previous_underscore:
+            cleaned.append("_")
+            previous_underscore = True
+    return "".join(cleaned).strip("_") or "-"
+
+
+def target_from_request(request):
+    payload = request.get("payload", {})
+    kind = request.get("kind")
+    if kind == "egress":
+        return f"{payload.get('host', '?')}:{payload.get('port', 443)}"
+    if kind in {"ssh", "ssh-lease"}:
+        return payload.get("target") or payload.get("target_key") or payload.get("alias") or "?"
+    if kind == "install":
+        args = " ".join(payload.get("arguments") or [])
+        return f"{payload.get('manager', '?')} {args}".strip()
+    if kind == "agent-login":
+        return payload.get("agent", "?")
+    return kind or "?"
+
+
+def request_reason(request):
+    payload = request.get("payload", {})
+    return compact_reason(payload.get("reason") or payload.get("deny_reason") or request.get("decision_reason") or "")
+
+
+def row_with_reason(prefix, target, reason, width, min_target_width=16, reason_width=24, target_width=None):
+    remaining = max(0, width - len(prefix) - 1)
+    if remaining <= min_target_width:
+        return prefix + fit_cell(target, remaining)
+    reason_label = compact_reason(reason)
+    actual_reason_width = min(reason_width, max(0, remaining - min_target_width - 1))
+    max_target_width = max(min_target_width, remaining - actual_reason_width - 1)
+    target_width = min(max_target_width, max(min_target_width, target_width or max_target_width))
+    if actual_reason_width <= 0:
+        return prefix + fit_cell(target, remaining)
+    return prefix + fit_cell(target, target_width) + "  " + fit_cell(reason_label, actual_reason_width)
+
+
+def visible_target_width(view, rows, width):
+    targets = []
+    for item in rows:
+        if view == "pending":
+            _path, request = item
+            targets.append(target_from_request(request))
+        elif view == "blacklist":
+            kind, _rule_index, entry = item
+            targets.append(ssh_alias_target(entry) if kind == "ssh" else approval_target(entry))
+        elif view == "approvals":
+            _rule_index, rule = item
+            targets.append(approval_target(rule))
+    if not targets:
+        return 16
+    return max(16, min(max(len(target) for target in targets), 34, max(16, width // 2)))
+
+
+def active_views_for_area(area):
+    return AREA_VIEWS.get(area, AREA_VIEWS["egress"])
+
+
+def process_command_label(entry):
+    cmdline = entry.get("cmdline") or entry.get("argv") or []
+    if isinstance(cmdline, list) and cmdline:
+        return shlex.join(str(part) for part in cmdline)
+    return entry.get("comm") or ""
+
+
+def request_process_lines(request):
+    scopes = request_scopes(request)
+    if not scopes:
+        return []
+    lines = ["", "process:"]
+    for scope_index, scope in enumerate(scopes, 1):
+        lines.append(
+            f"  scope {scope_index}: pid={scope.get('pid', '')} ppid={scope.get('ppid', '')} "
+            f"sid={scope.get('sid', '')} pgid={scope.get('pgid', '')} uid={scope.get('uid', '')}"
+        )
+        command = process_command_label(scope)
+        if command:
+            lines.append(f"    command: {command}")
+        tree = [entry for entry in scope.get("tree") or [] if isinstance(entry, dict)]
+        if tree:
+            lines.append("    ancestry:")
+            for entry in tree:
+                label = process_command_label(entry)
+                if not label:
+                    label = entry.get("comm", "")
+                lines.append(
+                    f"      pid={entry.get('pid', '')} comm={entry.get('comm', '')} "
+                    f"start={entry.get('starttime', '')} {label}"
+                )
+    return lines
+
+
 def detail_lines(request, ttl, path=None):
     payload = request.get("payload", {})
     lines = [
@@ -1412,6 +1531,7 @@ def detail_lines(request, ttl, path=None):
     ]
     if path:
         lines.append(f"file: {path}")
+    lines.extend(request_process_lines(request))
     lines.extend(["", "payload:"])
     for line in json.dumps(payload, indent=2, sort_keys=True).splitlines():
         lines.append(f"  {line}")
@@ -1433,7 +1553,7 @@ def approval_detail_lines(rule):
         f"ttl updated: {timestamp_label(rule.get('ttl_updated_at'))}",
         f"ttl: {ttl_label(rule.get('expires_at'))}",
         f"expires: {timestamp_label(rule.get('expires_at')) or 'forever'}",
-        f"reason: {rule.get('reason', '')}",
+        f"reason: {compact_reason(rule.get('reason', ''))}",
         "",
         "rule:",
     ]
@@ -1450,7 +1570,7 @@ def block_detail_lines(rule):
         f"protocols: {','.join(rule.get('protocols') or [])}",
         f"blocked: {timestamp_label(rule.get('blocked_at') or rule.get('created_at'))}",
         f"source request: {rule.get('source_request_id', '')}",
-        f"reason: {rule.get('reason', '')}",
+        f"reason: {compact_reason(rule.get('reason', ''))}",
         "",
         "block:",
     ]
@@ -1468,7 +1588,7 @@ def ssh_block_detail_lines(entry):
         f"identity: {entry.get('identity_file', '')}",
         f"blocked: {timestamp_label(entry.get('blocked_at'))}",
         f"source request: {entry.get('source_request_id', '')}",
-        f"reason: {entry.get('reason', '')}",
+        f"reason: {compact_reason(entry.get('reason', ''))}",
         "",
         "block:",
     ]
@@ -1607,7 +1727,7 @@ def draw_wrapped_lines(stdscr, y, width, lines, max_y):
 
 
 def help_text_for_view(view):
-    common = "tab view  s sort"
+    common = "tab view"
     if view == "pending":
         return f"{common}  +/- ttl  a approve  d deny  x forever deny"
     if view == "leases":
@@ -1621,6 +1741,38 @@ def help_text_for_view(view):
     return common
 
 
+def egress_pending_requests(requests):
+    return [item for item in requests if request_area(item[1]) == "egress"]
+
+
+def ssh_pending_requests(requests):
+    return [item for item in requests if request_area(item[1]) == "ssh"]
+
+
+def egress_blacklist(blocks):
+    return [item for item in blocks if item[0] == "egress"]
+
+
+def ssh_blacklist(blocks):
+    return [item for item in blocks if item[0] == "ssh"]
+
+
+def area_counts(area, pending, leases, sessions, approvals, blocks):
+    if area == "ssh":
+        return f"pending: {len(pending)}   leases: {len(leases)}   sessions: {len(sessions)}   blacklist: {len(blocks)}"
+    return f"pending: {len(pending)}   approvals: {len(approvals)}   blacklist: {len(blocks)}"
+
+
+def next_area_view(area, view):
+    views = active_views_for_area(area)
+    return views[(views.index(view) + 1) % len(views)] if view in views else views[0]
+
+
+def view_for_area(area, view):
+    views = active_views_for_area(area)
+    return view if view in views else views[0]
+
+
 def app(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -1632,19 +1784,25 @@ def app(stdscr):
     approval_index = 0
     block_index = 0
     ttl_index = 1
+    area = "egress"
     view = "pending"
-    sort_index = 0
     show_detail = True
     message = ""
     while True:
         removed = prune_expired_approvals()
         removed_ssh_leases = prune_expired_ssh_leases()
-        sort_mode = SORT_CHOICES[sort_index]
-        requests = request_files(sort_mode)
-        leases = active_ssh_leases(sort_mode)
-        sessions = active_ssh_sessions(sort_mode)
-        approvals = active_approvals(sort_mode)
-        blocks = active_blacklist(sort_mode)
+        all_requests = request_files()
+        all_blocks = active_blacklist()
+        leases = active_ssh_leases()
+        sessions = active_ssh_sessions()
+        approvals = active_approvals()
+        if area == "ssh":
+            requests = ssh_pending_requests(all_requests)
+            blocks = ssh_blacklist(all_blocks)
+        else:
+            requests = egress_pending_requests(all_requests)
+            blocks = egress_blacklist(all_blocks)
+        view = view_for_area(area, view)
         if index >= len(requests):
             index = max(0, len(requests) - 1)
         if lease_index >= len(leases):
@@ -1677,11 +1835,12 @@ def app(stdscr):
             active_index = approval_index
         help_text = help_text_for_view(view)
         draw_text(stdscr, 0, 0, "Hardened Jail Operator", curses.A_BOLD)
+        draw_area_hint(stdscr, area)
         draw_text(stdscr, 1, 0, f"home: {BASE}")
         draw_full_width_text(
             stdscr,
             2,
-            f"view: {view}   pending: {len(requests)}   leases: {len(leases)}   sessions: {len(sessions)}   approvals: {len(approvals)}   blacklist: {len(blocks)}   ttl: {TTL_CHOICES[ttl_index]}   sort: {sort_mode}",
+            f"area: {area}   view: {view}   {area_counts(area, requests, leases, sessions, approvals, blocks)}   ttl: {TTL_CHOICES[ttl_index]}",
             view_header_attr(view, color_enabled),
         )
         draw_text(stdscr, 3, 0, BROKER_STATUS[: width - 1])
@@ -1694,14 +1853,17 @@ def app(stdscr):
         draw_text(stdscr, 4, 0, status[: width - 1])
         list_height = page_size(height)
         start = max(0, min(active_index, max(0, len(active_rows) - list_height)))
-        for row, item in enumerate(active_rows[start:start + list_height]):
+        visible_rows = active_rows[start:start + list_height]
+        target_width = visible_target_width(view, visible_rows, width)
+        for row, item in enumerate(visible_rows):
             item_index = start + row
             attr = curses.A_REVERSE if item_index == active_index else 0
             if view == "pending":
                 _path, request = item
                 seen = int(request.get("seen_count") or 1)
                 count = f"x{seen}" if seen > 1 else "  "
-                line = f"{item_index + 1:2d} {timestamp_label(request.get('last_seen_at') or request.get('created_at')):23s} {count:>4s}  {summarize(request)}"
+                prefix = f"{item_index + 1:2d} {row_time(request.get('last_seen_at') or request.get('created_at')):23s} {count:>4s} "
+                line = row_with_reason(prefix, target_from_request(request), request_reason(request), width, reason_width=22, target_width=target_width)
             elif view == "leases":
                 _path, lease = item
                 scopes = len(lease.get("scopes") or [])
@@ -1713,10 +1875,12 @@ def app(stdscr):
             elif view == "blacklist":
                 kind, _rule_index, entry = item
                 target = ssh_alias_target(entry) if kind == "ssh" else approval_target(entry)
-                line = f"{item_index + 1:2d} {kind:7s}     {target:36s}  {entry.get('name') or entry.get('alias', '')}"
+                prefix = f"{item_index + 1:2d} {row_time(entry.get('blocked_at') or entry.get('created_at')):23s} "
+                line = row_with_reason(prefix, target, entry.get("reason", ""), width, reason_width=24, target_width=target_width)
             else:
                 _rule_index, rule = item
-                line = f"{item_index + 1:2d} {ttl_label(rule.get('expires_at')):10s}  {approval_target(rule):36s}  {rule.get('name', 'unnamed')}"
+                prefix = f"{item_index + 1:2d} {ttl_label(rule.get('expires_at')):10s} {row_time(rule.get('approved_at') or rule.get('created_at')):23s} "
+                line = row_with_reason(prefix, approval_target(rule), rule.get("reason", ""), width, reason_width=24, target_width=target_width)
             draw_text(stdscr, 6 + row, 0, line, attr)
         if active_rows and show_detail:
             y = 7 + list_height
@@ -1738,11 +1902,11 @@ def app(stdscr):
             draw_wrapped_lines(stdscr, y, width, lines[: max(0, height - y - 1)], height - 1)
         elif not active_rows:
             empty = {
-                "pending": "No pending requests.",
+                "pending": f"No pending {area} requests.",
                 "leases": "No active SSH leases.",
                 "sessions": "No SSH sessions.",
                 "approvals": "No active approvals.",
-                "blacklist": "No blocklisted targets.",
+                "blacklist": f"No blocklisted {area} targets.",
             }[view]
             draw_text(stdscr, 7, 0, empty)
         else:
@@ -1760,9 +1924,13 @@ def app(stdscr):
         if key in (ord("q"), 27, 3, 4):
             break
         if key in (ord("\t"),):
-            view = VIEW_CHOICES[(VIEW_CHOICES.index(view) + 1) % len(VIEW_CHOICES)]
+            view = next_area_view(area, view)
+        elif key == ord("e"):
+            area = "egress"
+            view = view_for_area(area, view)
         elif key == ord("s"):
-            sort_index = (sort_index + 1) % len(SORT_CHOICES)
+            area = "ssh"
+            view = view_for_area(area, view)
         elif key in (curses.KEY_DOWN, ord("j")) and active_rows:
             if view == "pending":
                 index = min(index + 1, len(requests) - 1)

@@ -75,19 +75,28 @@ def process_tree():
             starttime = stat[21]
         except (OSError, IndexError, ValueError):
             break
-        tree.append({"pid": pid, "comm": comm, "starttime": starttime})
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmdline = [part.decode("utf-8", "replace") for part in fh.read().split(b"\0") if part]
+        except OSError:
+            cmdline = []
+        tree.append({"pid": pid, "comm": comm, "starttime": starttime, "cmdline": cmdline})
         pid = ppid
     return tree
 
 
 def session_scope():
+    tree = process_tree()
+    current = tree[0] if tree else {}
     return {
         "pid": os.getpid(),
         "ppid": os.getppid(),
         "sid": os.getsid(0),
         "pgid": os.getpgrp(),
         "uid": os.getuid(),
-        "tree": process_tree(),
+        "comm": current.get("comm", ""),
+        "cmdline": current.get("cmdline", []),
+        "tree": tree,
     }
 
 

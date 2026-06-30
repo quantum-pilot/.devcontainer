@@ -126,7 +126,7 @@ def write_auto_request(protocol, host, port, target, reason):
                 "port": int(port or 443),
                 "protocols": [protocol],
                 "ttl": "10m",
-                "reason": f"auto request after denied {protocol} to {host}:{int(port or 443)}",
+                "reason": f"AUTO_DENIED_{protocol.upper()}",
                 "target": target,
                 "deny_reason": reason,
             },
