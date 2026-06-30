@@ -20,6 +20,7 @@ REQUEST_DIR = pathlib.Path(os.environ.get("EGRESS_REQUEST_DIR", "/jail-requests"
 BIND = os.environ.get("EGRESS_BIND", "0.0.0.0")
 PORT = int(os.environ.get("EGRESS_PORT", "8080"))
 BUFFER_SIZE = 64 * 1024
+BODY_METHODS = {"POST", "PUT", "PATCH"}
 WAIT_FOR_APPROVAL = os.environ.get("EGRESS_WAIT_FOR_APPROVAL", "true").lower() not in {"0", "false", "no"}
 APPROVAL_WAIT_TIMEOUT = int(os.environ.get("EGRESS_APPROVAL_WAIT_TIMEOUT", "0"))
 APPROVAL_POLL_SECONDS = float(os.environ.get("EGRESS_APPROVAL_POLL_SECONDS", "1"))
@@ -356,6 +357,22 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             headers.append(line)
         return headers
 
+    def header_value(self, headers, name):
+        prefix = name.lower().encode("ascii") + b":"
+        for header in headers:
+            if header.lower().startswith(prefix):
+                return header.split(b":", 1)[1].strip().decode("iso-8859-1")
+        return ""
+
+    def request_body_length(self, method, headers):
+        transfer_encoding = self.header_value(headers, "Transfer-Encoding").lower()
+        if transfer_encoding and transfer_encoding != "identity":
+            raise ValueError("chunked request bodies are not supported by this proxy")
+        content_length = self.header_value(headers, "Content-Length")
+        if content_length:
+            return int(content_length)
+        return 0 if method.upper() not in BODY_METHODS else 0
+
     def deny(self, reason, host, port, target, extra=None):
         protocol = extra.get("protocol") if extra else None
         body = deny_body(reason, host, port, target, protocol).encode("utf-8")
@@ -417,18 +434,23 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         self.relay(upstream)
 
     def handle_http(self, method, target, host, port, headers, request_line):
+        try:
+            body_length = self.request_body_length(method, headers)
+        except (ValueError, UnicodeError) as exc:
+            self.deny("unsupported_request_body", host, port, target, {"protocol": "http", "method": method, "detail": str(exc)})
+            return
         ok, info = allowed("http", host, port)
         if not ok:
             if info.get("reason") == "default_deny":
                 ok, info = wait_for_operator_decision("http", host, port, target, info["reason"])
             if ok:
-                self.allow_http(method, target, host, port, headers, info)
+                self.allow_http(method, target, host, port, headers, body_length, info)
                 return
             self.deny(info.get("reason", "default_deny"), host, port, target, {"protocol": "http", "method": method, **info})
             return
-        self.allow_http(method, target, host, port, headers, info)
+        self.allow_http(method, target, host, port, headers, body_length, info)
 
-    def allow_http(self, method, target, host, port, headers, info):
+    def allow_http(self, method, target, host, port, headers, body_length, info):
         append_log({
             "decision": "allow",
             "protocol": "http",
@@ -454,6 +476,13 @@ class ProxyHandler(socketserver.StreamRequestHandler):
                 if not header.lower().startswith(b"proxy-connection:"):
                     upstream.sendall(header)
             upstream.sendall(b"\r\n")
+            remaining = body_length
+            while remaining:
+                chunk = self.rfile.read(min(BUFFER_SIZE, remaining))
+                if not chunk:
+                    return
+                upstream.sendall(chunk)
+                remaining -= len(chunk)
             self.relay(upstream)
 
     def relay(self, upstream):

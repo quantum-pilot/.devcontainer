@@ -22,7 +22,7 @@
         "bind": "127.0.0.1",
         "profile": "$HOME/.chrome-remote-test"
       },
-      "bridgePorts": [5432, 5435, 8787]
+      "bridgePorts": [5432, 5435]
     },
     "vscode": {
       "extensions": [

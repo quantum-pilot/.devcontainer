@@ -717,6 +717,9 @@ def group_pending_requests(rows):
             existing_request["last_seen_at"] = request.get("last_seen_at") or request.get("created_at")
         existing_payload = existing_request.setdefault("payload", {})
         payload = request.get("payload", {})
+        if request.get("kind") in {"ssh", "ssh-lease"}:
+            existing_request["payload"] = merge_ssh_payload(existing_payload, payload)
+            continue
         protocols = sorted(set(existing_payload.get("protocols") or []) | set(payload.get("protocols") or []))
         if protocols:
             existing_payload["protocols"] = protocols
@@ -1277,6 +1280,11 @@ def run_brokered_ssh(sock, client_request, send_lock):
             path, _request = write_or_merge_ssh_request(payload)
             send_error("ssh broker: waiting for host operator approval\n")
             if not wait_for_operator_resolution(path, send_error):
+                frame_send(sock, FRAME_EXIT, json.dumps({"exit_status": 1}), send_lock)
+                return
+            lease_path, _lease = live_ssh_lease_for_payload(payload)
+            if not lease_path:
+                send_error("ssh broker: approved, but no matching SSH lease was created\n")
                 frame_send(sock, FRAME_EXIT, json.dumps({"exit_status": 1}), send_lock)
                 return
         request = {"payload": payload, "id": client_request.get("id", "")}

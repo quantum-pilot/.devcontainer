@@ -7,6 +7,7 @@ mkdir -p \
   "$HOME/.local/bin" \
   "$HOME/.local/cache/zsh" \
   "$HOME/.local/config" \
+  "$HOME/.local/config/git" \
   "$HOME/.local/config/shell" \
   "$HOME/.local/cache/mise" \
   "$HOME/.local/cache/uv" \

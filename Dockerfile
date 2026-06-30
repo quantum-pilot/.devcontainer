@@ -14,7 +14,6 @@ ENV EDITOR=nano
 ENV VISUAL=nano
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=/usr/local/share/npm-global/bin:/home/${USERNAME}/.local/bin:${PATH}
-ENV GIT_CONFIG_GLOBAL=/home/${USERNAME}/.gitconfig
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -59,12 +58,15 @@ RUN env \
     UV_TOOL_BIN_DIR=/usr/local/bin \
     uv tool install 'headroom-ai[proxy]'
 
+RUN git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git /usr/local/share/oh-my-zsh
+
 RUN mkdir -p \
     /home/${USERNAME}/.agents \
     /home/${USERNAME}/.claude \
     /home/${USERNAME}/.claude-home \
     /home/${USERNAME}/.codex \
     /home/${USERNAME}/.config/git \
+    /home/${USERNAME}/.local/config/git \
     /home/${USERNAME}/.gsd \
     /home/${USERNAME}/.local/bin \
     /home/${USERNAME}/.local/cache/zsh \
@@ -130,6 +132,12 @@ RUN mkdir -p \
     'export ANTHROPIC_BASE_URL="http://${HEADROOM_HOST}:${HEADROOM_PORT}"' \
     'export OPENAI_BASE_URL="http://${HEADROOM_HOST}:${HEADROOM_PORT}/v1"' \
     'export GIT_SSH=/usr/local/bin/ssh' \
+    'export ZSH=/usr/local/share/oh-my-zsh' \
+    'export ZSH_DISABLE_COMPFIX=true' \
+    'export DISABLE_AUTO_UPDATE=true' \
+    'ZSH_THEME=""' \
+    'plugins=(git)' \
+    'source "$ZSH/oh-my-zsh.sh"' \
     'alias m="mise"' \
     'eval "$(mise activate zsh)"' \
     'if [[ -r "$HOME/.zshrc.local" ]]; then source "$HOME/.zshrc.local"; fi' \
@@ -200,6 +208,7 @@ ENV npm_config_https_proxy=http://proxy:8080
 ENV NPM_CONFIG_PREFIX=/home/${USERNAME}/.local
 ENV PNPM_HOME=/home/${USERNAME}/.local/share/pnpm
 ENV XDG_CONFIG_HOME=/home/${USERNAME}/.local/config
+ENV GIT_CONFIG_GLOBAL=/home/${USERNAME}/.local/config/git/config
 ENV GNUPGHOME=/home/${USERNAME}/.local/share/gnupg
 ENV UV_CACHE_DIR=/home/${USERNAME}/.local/cache/uv
 ENV UV_PYTHON_INSTALL_DIR=/home/${USERNAME}/.local/share/uv/python
