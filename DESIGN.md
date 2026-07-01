@@ -236,6 +236,12 @@ OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 `headroom-proxy` unsets those variables before starting Headroom so the proxy
 does not route upstream requests back into itself.
 
+The wrapper uses conservative Claude-friendly transport defaults: HTTP/1.1
+upstream, longer request/connect/read timeouts, more retries, no CCR tool
+injection, and no subscription poller. Each setting remains overridable through
+the matching `HEADROOM_*` environment variable before `jail bootstrap` starts
+the proxy.
+
 `jail agent-login claude` unsets `ANTHROPIC_BASE_URL` for the login command,
 and `jail agent-login codex` unsets `OPENAI_BASE_URL`, so authentication can
 use the official upstream login paths.

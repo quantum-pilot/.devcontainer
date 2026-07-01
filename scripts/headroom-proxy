@@ -5,6 +5,13 @@ export HEADROOM_HOST="${HEADROOM_HOST:-127.0.0.1}"
 export HEADROOM_PORT="${HEADROOM_PORT:-8787}"
 export HEADROOM_HOME="${HEADROOM_HOME:-$HOME/.local/share/headroom}"
 export HEADROOM_LOG_FILE="${HEADROOM_LOG_FILE:-$HEADROOM_HOME/proxy.jsonl}"
+export HEADROOM_REQUEST_TIMEOUT="${HEADROOM_REQUEST_TIMEOUT:-900}"
+export HEADROOM_CONNECT_TIMEOUT_SECONDS="${HEADROOM_CONNECT_TIMEOUT_SECONDS:-30}"
+export HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS="${HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS:-900}"
+export HEADROOM_RETRY_MAX_ATTEMPTS="${HEADROOM_RETRY_MAX_ATTEMPTS:-5}"
+export HEADROOM_HTTP2="${HEADROOM_HTTP2:-0}"
+export HEADROOM_NO_CCR_INJECT_TOOL="${HEADROOM_NO_CCR_INJECT_TOOL:-1}"
+export HEADROOM_NO_SUBSCRIPTION_TRACKING="${HEADROOM_NO_SUBSCRIPTION_TRACKING:-1}"
 
 mkdir -p "$HEADROOM_HOME"
 
@@ -12,8 +19,28 @@ mkdir -p "$HEADROOM_HOME"
 unset ANTHROPIC_BASE_URL
 unset OPENAI_BASE_URL
 
-cd /workspace
-exec headroom proxy \
-  --host "$HEADROOM_HOST" \
-  --port "$HEADROOM_PORT" \
+args=(
+  proxy
+  --host "$HEADROOM_HOST"
+  --port "$HEADROOM_PORT"
   --log-file "$HEADROOM_LOG_FILE"
+  --request-timeout-seconds "$HEADROOM_REQUEST_TIMEOUT"
+  --connect-timeout-seconds "$HEADROOM_CONNECT_TIMEOUT_SECONDS"
+  --anthropic-buffered-request-timeout-seconds "$HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS"
+  --retry-max-attempts "$HEADROOM_RETRY_MAX_ATTEMPTS"
+)
+
+case "${HEADROOM_HTTP2,,}" in
+  0|false|no|off) args+=(--no-http2) ;;
+esac
+
+case "${HEADROOM_NO_CCR_INJECT_TOOL,,}" in
+  1|true|yes|on) args+=(--no-ccr-inject-tool) ;;
+esac
+
+case "${HEADROOM_NO_SUBSCRIPTION_TRACKING,,}" in
+  1|true|yes|on) args+=(--no-subscription-tracking) ;;
+esac
+
+cd /workspace
+exec headroom "${args[@]}"

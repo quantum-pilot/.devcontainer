@@ -100,7 +100,7 @@ RUN mkdir -p \
     'set -g mouse on' \
     'bind c new-window -c "#{pane_current_path}"' \
     'bind % split-window -h -c "#{pane_current_path}"' \
-    'bind " split-window -v -c "#{pane_current_path}"' \
+    'bind \" split-window -v -c "#{pane_current_path}"' \
     > /home/${USERNAME}/.tmux.conf \
   && printf '%s\n' \
     'export HISTFILE=/shell_history/.zsh_history' \

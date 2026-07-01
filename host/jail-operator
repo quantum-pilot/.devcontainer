@@ -41,6 +41,7 @@ AREA_VIEWS = {
 }
 VIEW_COLOR_PAIR_BASE = 20
 AGE_COLOR_PAIR_BASE = 30
+STATUS_COLOR_PAIR_BASE = 40
 VIEW_COLOR_SPECS = {
     "pending": (curses.COLOR_WHITE, curses.COLOR_BLUE),
     "leases": (curses.COLOR_WHITE, curses.COLOR_GREEN),
@@ -58,6 +59,12 @@ AGE_COLOR_SPECS_FALLBACK = [
     (300, curses.COLOR_WHITE, curses.COLOR_GREEN),
     (900, curses.COLOR_WHITE, curses.COLOR_GREEN),
 ]
+STATUS_COLOR_SPECS = {
+    "pending": curses.COLOR_CYAN,
+    "approvals": curses.COLOR_GREEN,
+    "sessions": curses.COLOR_MAGENTA,
+    "blacklist": curses.COLOR_RED,
+}
 BROKER_STATUS = "ssh broker: starting"
 SSH_SESSIONS = {}
 SSH_SESSIONS_LOCK = threading.Lock()
@@ -1467,6 +1474,12 @@ def init_view_colors():
             curses.init_pair(AGE_COLOR_PAIR_BASE + offset, foreground, background)
         except curses.error:
             return False
+    for offset, view_name in enumerate(VIEW_CHOICES):
+        foreground = STATUS_COLOR_SPECS.get(view_name, curses.COLOR_WHITE)
+        try:
+            curses.init_pair(STATUS_COLOR_PAIR_BASE + offset, foreground, -1)
+        except curses.error:
+            return False
     return True
 
 
@@ -1474,6 +1487,23 @@ def view_header_attr(view, color_enabled):
     if not color_enabled:
         return curses.A_REVERSE | curses.A_BOLD
     return curses.color_pair(VIEW_COLOR_PAIR_BASE + VIEW_CHOICES.index(view)) | curses.A_BOLD
+
+
+def status_attr(status, color_enabled):
+    if not color_enabled:
+        return curses.A_BOLD
+    lowered = status.lower()
+    if "pending" in lowered:
+        view_name = "pending"
+    elif "lease" in lowered or "approved" in lowered:
+        view_name = "approvals"
+    elif "session" in lowered:
+        view_name = "sessions"
+    elif "blocked" in lowered:
+        view_name = "blacklist"
+    else:
+        return curses.A_BOLD
+    return curses.color_pair(STATUS_COLOR_PAIR_BASE + VIEW_CHOICES.index(view_name)) | curses.A_BOLD
 
 
 def request_area(request):
@@ -1607,6 +1637,63 @@ def visible_target_width(view, rows, width):
     if not targets:
         return 16
     return max(16, min(max(len(target) for target in targets), 34, max(16, width // 2)))
+
+
+def filter_entry(ttl, timestamp, target, status, area, view, source_index):
+    return {
+        "ttl": ttl or "-",
+        "timestamp": row_time(timestamp),
+        "target": target or "?",
+        "status": status,
+        "area": area,
+        "view": view,
+        "source_index": source_index,
+    }
+
+
+def filter_entries(all_requests, leases, sessions, approvals, all_blocks, query):
+    needle = query.lower()
+    rows = []
+    pending_indexes = {"egress": 0, "ssh": 0}
+    for _source_index, (_path, request) in enumerate(all_requests):
+        request_view_area = request_area(request)
+        source_index = pending_indexes[request_view_area]
+        pending_indexes[request_view_area] += 1
+        target = target_from_request(request)
+        if needle in target.lower():
+            rows.append(filter_entry(request.get("payload", {}).get("ttl") or "-", request.get("last_seen_at") or request.get("created_at"), target, "PENDING", request_area(request), "pending", source_index))
+    for source_index, (_path, lease) in enumerate(leases):
+        target = ssh_lease_target(lease)
+        if needle in target.lower():
+            rows.append(filter_entry(ttl_label(lease.get("expires_at")), lease.get("created_at"), target, "LEASE", "ssh", "leases", source_index))
+    for source_index, (_session_id, session) in enumerate(sessions):
+        target = session.get("target", "")
+        if needle in target.lower():
+            status = f"SESSION_{str(session.get('status') or '').upper() or 'UNKNOWN'}"
+            rows.append(filter_entry("-", session.get("started_at"), target, status, "ssh", "sessions", source_index))
+    for source_index, (_rule_index, rule) in enumerate(approvals):
+        target = approval_target(rule)
+        if needle in target.lower():
+            rows.append(filter_entry(ttl_label(rule.get("expires_at")), rule.get("approved_at") or rule.get("created_at"), target, "APPROVED", "egress", "approvals", source_index))
+    block_indexes = {"egress": 0, "ssh": 0}
+    for _source_index, (kind, _rule_index, entry) in enumerate(all_blocks):
+        source_index = block_indexes[kind]
+        block_indexes[kind] += 1
+        target = ssh_alias_target(entry) if kind == "ssh" else approval_target(entry)
+        if needle in target.lower():
+            rows.append(filter_entry("forever", entry.get("blocked_at") or entry.get("created_at"), target, "BLOCKED", kind, "blacklist", source_index))
+    rows.sort(key=lambda item: parse_time("" if item["timestamp"] == "NO_TIMESTAMP" else item["timestamp"]) or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
+    return rows
+
+
+def draw_filter_row(stdscr, y, width, index, entry, selected, color_enabled):
+    attr = curses.A_REVERSE if selected else 0
+    status_width = min(18, max(8, width // 5))
+    prefix = f"{index + 1:2d} {fit_cell(entry['ttl'], 10)} {fit_cell(entry['timestamp'], TIMESTAMP_WIDTH)} "
+    target_width = max(8, width - len(prefix) - status_width - 3)
+    line = prefix + fit_cell(entry["target"], target_width) + "  "
+    draw_text(stdscr, y, 0, line, attr)
+    draw_text(stdscr, y, len(line), fit_cell(entry["status"], status_width), status_attr(entry["status"], color_enabled) | (curses.A_REVERSE if selected else 0))
 
 
 def active_views_for_area(area):
@@ -1859,7 +1946,7 @@ def draw_wrapped_lines(stdscr, y, width, lines, max_y):
 
 
 def help_text_for_view(view):
-    common = "tab view"
+    common = "tab view  / filter"
     if view == "pending":
         return f"{common}  +/- ttl  a approve  d deny  x forever deny"
     if view == "leases":
@@ -1919,6 +2006,8 @@ def app(stdscr):
     area = "egress"
     view = "pending"
     show_detail = True
+    filter_query = ""
+    filter_index = 0
     message = ""
     while True:
         removed = prune_expired_approvals()
@@ -1945,6 +2034,9 @@ def app(stdscr):
             approval_index = max(0, len(approvals) - 1)
         if block_index >= len(blocks):
             block_index = max(0, len(blocks) - 1)
+        filtered_rows = filter_entries(all_requests, leases, sessions, approvals, all_blocks, filter_query) if filter_query else []
+        if filter_index >= len(filtered_rows):
+            filter_index = max(0, len(filtered_rows) - 1)
         stdscr.erase()
         height, width = stdscr.getmaxyx()
         if view == "pending":
@@ -1965,23 +2057,77 @@ def app(stdscr):
         else:
             active_rows = approvals
             active_index = approval_index
-        help_text = help_text_for_view(view)
+        help_text = "esc clear filter" if filter_query else help_text_for_view(view)
         draw_text(stdscr, 0, 0, "Hardened Jail Operator", curses.A_BOLD)
         draw_area_hint(stdscr, area)
         draw_text(stdscr, 1, 0, f"{current_minute_label()}   {BASE}")
-        header = f"area: {area}   view: {view}   {area_counts(area, requests, leases, sessions, approvals, blocks)}   ttl: {TTL_CHOICES[ttl_index]}"
+        header = f"area: {area}   view: {'filter' if filter_query else view}   {area_counts(area, requests, leases, sessions, approvals, blocks)}   ttl: {TTL_CHOICES[ttl_index]}"
         draw_full_width_text(stdscr, 2, header)
-        view_x = header.find(f"view: {view}") + len("view: ")
-        draw_text(stdscr, 2, view_x, view, view_header_attr(view, color_enabled))
+        header_view = "filter" if filter_query else view
+        view_x = header.find(f"view: {header_view}") + len("view: ")
+        draw_text(stdscr, 2, view_x, header_view, curses.A_REVERSE | curses.A_BOLD if filter_query else view_header_attr(view, color_enabled))
         draw_text(stdscr, 3, 0, BROKER_STATUS[: width - 1])
         expired_messages = []
         if removed:
             expired_messages.append(f"{removed} expired approval(s)")
         if removed_ssh_leases:
             expired_messages.append(f"{removed_ssh_leases} expired SSH lease(s)")
-        status = message or (f"removed {', '.join(expired_messages)}" if expired_messages else help_text)
+        status = message or (f"filter: {filter_query}   matches: {len(filtered_rows)}   {help_text}" if filter_query else (f"removed {', '.join(expired_messages)}" if expired_messages else help_text))
         draw_text(stdscr, 4, 0, status[: width - 1])
         list_height = page_size(height)
+        if filter_query:
+            start = max(0, min(filter_index, max(0, len(filtered_rows) - list_height)))
+            visible_filter_rows = filtered_rows[start:start + list_height]
+            for row, entry in enumerate(visible_filter_rows):
+                item_index = start + row
+                draw_filter_row(stdscr, 6 + row, width, item_index, entry, item_index == filter_index, color_enabled)
+            if not filtered_rows:
+                draw_text(stdscr, 7, 0, f"No host matches for: {filter_query}")
+            stdscr.refresh()
+            try:
+                key = stdscr.getch()
+            except KeyboardInterrupt:
+                break
+            if key == -1:
+                message = ""
+                continue
+            message = ""
+            if key == 27:
+                filter_query = ""
+                filter_index = 0
+            elif key in (ord("q"), 3, 4):
+                break
+            elif key == ord("/"):
+                filter_query = prompt_line(stdscr, "filter host contains: ")
+                filter_index = 0
+            elif key in (curses.KEY_ENTER, 10, 13) and filtered_rows:
+                selected = filtered_rows[filter_index]
+                area = selected["area"]
+                view = view_for_area(area, selected["view"])
+                source_index = int(selected.get("source_index") or 0)
+                if view == "pending":
+                    index = source_index
+                elif view == "leases":
+                    lease_index = source_index
+                elif view == "sessions":
+                    session_index = source_index
+                elif view == "approvals":
+                    approval_index = source_index
+                elif view == "blacklist":
+                    block_index = source_index
+                filter_query = ""
+                filter_index = 0
+                message = f"selected {selected['status']} {selected['target']}"
+            elif key in (curses.KEY_DOWN, ord("j")) and filtered_rows:
+                filter_index = min(filter_index + 1, len(filtered_rows) - 1)
+            elif key in (curses.KEY_UP, ord("k")) and filtered_rows:
+                filter_index = max(filter_index - 1, 0)
+            elif key in (curses.KEY_NPAGE, ord(" ")) and filtered_rows:
+                filter_index = move_page(filter_index, len(filtered_rows), height, 1)
+            elif key in (curses.KEY_PPAGE, ord("b"), ord("B")) and filtered_rows:
+                filter_index = move_page(filter_index, len(filtered_rows), height, -1)
+            continue
+
         start = max(0, min(active_index, max(0, len(active_rows) - list_height)))
         visible_rows = active_rows[start:start + list_height]
         target_width = visible_target_width(view, visible_rows, width)
@@ -2056,7 +2202,10 @@ def app(stdscr):
         message = ""
         if key in (ord("q"), 27, 3, 4):
             break
-        if key in (ord("\t"),):
+        if key == ord("/"):
+            filter_query = prompt_line(stdscr, "filter host contains: ")
+            filter_index = 0
+        elif key in (ord("\t"),):
             view = next_area_view(area, view)
         elif key == ord("e"):
             area = "egress"
