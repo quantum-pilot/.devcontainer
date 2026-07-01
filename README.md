@@ -20,7 +20,7 @@ Install:
 2. Open the project folder in VS Code.
 3. Run `Dev Containers: Reopen in Container`.
 4. VS Code runs `.devcontainer/host/jail-init` automatically and builds the services.
-5. After the container opens, `jail-hardening-check` runs.
+5. After the container opens, `jail check` runs.
 
 Host-owned jail state lives outside the project at:
 
@@ -36,7 +36,7 @@ a different location.
 Inside the worker:
 
 ```bash
-jail-hardening-check
+jail check
 ```
 
 Expected result: every check prints `OK`.
@@ -48,6 +48,19 @@ curl -I https://example.com
 ```
 
 Before approval, this creates a pending request and holds the client connection.
+
+## Jail Helper
+
+The worker exposes one helper command:
+
+```bash
+jail check
+jail bootstrap
+jail agent-login codex
+jail agent-login claude
+jail tmux snapshot
+jail tmux restore
+```
 
 ## Operator
 
@@ -110,8 +123,8 @@ Rebuilds recreate containers and kill running tmux processes. Save and restore
 the layout with:
 
 ```bash
-jail-tmux snapshot
-jail-tmux restore
+jail tmux snapshot
+jail tmux restore
 ```
 
 The snapshot is stored at `.devcontainer/.jail/tmux-layout.json`. It includes

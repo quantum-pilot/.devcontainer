@@ -206,14 +206,14 @@ Because `/home/node` is read-only, the image creates:
 
 ## Headroom
 
-`jail-start` starts `headroom-proxy` in a detached tmux session named by
+`jail bootstrap` starts `headroom-proxy` in a detached tmux session named by
 `JAIL_HEADROOM_TMUX_SESSION` when both `tmux` and `headroom` are available.
 `~/.headroom` is an image symlink to `/home/node/.local/share/headroom` because
 Headroom writes some cache state there even when the proxy log path is explicit.
 The image tmux config enables mouse mode by default.
 
-`jail-tmux snapshot` records all tmux sessions into
-`.devcontainer/.jail/tmux-layout.json`. `jail-tmux restore` recreates all
+`jail tmux snapshot` records all tmux sessions into
+`.devcontainer/.jail/tmux-layout.json`. `jail tmux restore` recreates all
 sessions, windows, panes, working directories, active selections, and configured
 pane commands. Managed sessions listed in `JAIL_MANAGED_TMUX_SESSIONS` are
 ignored because runtime startup recreates them automatically. Commands are
@@ -287,7 +287,7 @@ direct host-gateway route.
 
 ## Verification
 
-`scripts/jail-hardening-check` verifies the important boundary assumptions
+`jail check` verifies the important boundary assumptions
 inside the worker, including:
 
 - no passwordless sudo

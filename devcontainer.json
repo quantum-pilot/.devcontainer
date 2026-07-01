@@ -40,5 +40,5 @@
       }
     }
   },
-  "postCreateCommand": "jail-hardening-check"
+  "postCreateCommand": "jail check"
 }

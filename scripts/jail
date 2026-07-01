@@ -5,12 +5,231 @@ import hashlib
 import json
 import os
 import pathlib
+import shlex
+import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 
 
 REQUEST_DIR = pathlib.Path(os.environ.get("JAIL_REQUEST_DIR", "/jail-requests"))
+DEFAULT_TMUX_LAYOUT = Path(os.environ.get("JAIL_TMUX_LAYOUT", "/workspace/.devcontainer/.jail/tmux-layout.json"))
+TMUX_SEP = "\x1f"
+CHECK_SCRIPT = r"""
+fail=0
+
+check_fail() {
+  printf 'FAIL: %s\n' "$1"
+  fail=1
+}
+
+check_ok() {
+  printf 'OK: %s\n' "$1"
+}
+
+if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+  check_fail "passwordless sudo is available"
+else
+  check_ok "passwordless sudo unavailable"
+fi
+
+if id -nG | tr ' ' '\n' | grep -qx root; then
+  check_fail "user is in root group"
+else
+  check_ok "user is not in root group"
+fi
+
+if [[ -S /var/run/docker.sock || -S /run/docker.sock ]]; then
+  check_fail "Docker socket is mounted"
+else
+  check_ok "Docker socket absent"
+fi
+
+if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+  check_fail "SSH_AUTH_SOCK is present"
+else
+  check_ok "SSH agent socket absent"
+fi
+
+if [[ -r /jail-ssh-broker-token && -n "${JAIL_SSH_BROKER_HOST:-}" && -n "${JAIL_SSH_BROKER_PORT:-}" ]]; then
+  check_ok "SSH broker configuration is mounted"
+else
+  check_fail "SSH broker configuration is missing"
+fi
+
+if [[ "$(command -v ssh)" == "/usr/local/bin/ssh" && "$(readlink -f /usr/bin/ssh 2>/dev/null || true)" == "/usr/local/bin/ssh" ]]; then
+  check_ok "SSH resolves to the broker shim"
+else
+  check_fail "SSH does not resolve to the broker shim"
+fi
+
+if [[ ! -x /usr/bin/ssh.real ]]; then
+  check_ok "raw OpenSSH client is not directly executable"
+else
+  check_fail "raw OpenSSH client remains directly executable"
+fi
+
+if find "$HOME/.ssh" -maxdepth 1 -type f \( -name 'id_*' ! -name '*.pub' \) 2>/dev/null | grep -q .; then
+  check_fail "SSH private key exists in home"
+else
+  check_ok "SSH private keys absent from home"
+fi
+
+if [[ -d "$HOME/.claude" && -d "$HOME/.codex" && -d "$HOME/.agents" ]]; then
+  check_ok "agent state directories are available inside the jail"
+else
+  check_fail "agent state directories are missing"
+fi
+
+if [[ -L "$HOME/.claude.json" && -d "$HOME/.claude-home" && -w "$HOME/.claude-home" ]]; then
+  check_ok "Claude home-level state is persisted through a writable volume"
+else
+  check_fail "Claude home-level state is not persisted"
+fi
+
+if [[ -e /policy/approvals.json || -e "$HOME/.devcontainer-jail/policy/approvals.json" ]]; then
+  check_fail "host approval policy is visible in the worker"
+else
+  check_ok "host approval policy is not mounted in the worker"
+fi
+
+if awk '/NoNewPrivs:/ { exit ($2 == 1 ? 0 : 1) }' /proc/self/status; then
+  check_ok "no_new_privs is enabled"
+else
+  check_fail "no_new_privs is not enabled"
+fi
+
+if awk '/Seccomp:/ { exit ($2 == 0 ? 1 : 0) }' /proc/self/status; then
+  check_ok "seccomp is enabled"
+else
+  check_fail "seccomp is disabled"
+fi
+
+cap_eff=$(awk '/CapEff:/ { print $2 }' /proc/self/status)
+if [[ "$cap_eff" == "0000000000000000" ]]; then
+  check_ok "effective capabilities are empty"
+else
+  check_fail "effective capabilities are not empty: $cap_eff"
+fi
+
+if [[ "${HTTP_PROXY:-}" == "http://proxy:8080" && "${HTTPS_PROXY:-}" == "http://proxy:8080" ]]; then
+  check_ok "proxy environment points at proxy"
+else
+  check_fail "proxy environment is not configured for proxy"
+fi
+
+pnpm_global_bin="${PNPM_HOME:-$HOME/.local/share/pnpm}/bin"
+case ":$PATH:" in
+  *":$pnpm_global_bin:"*|*":${PNPM_HOME:-$HOME/.local/share/pnpm}:"*)
+    check_ok "pnpm global bin location is on PATH"
+    ;;
+  *)
+    check_fail "pnpm global bin location is missing from PATH: ${PNPM_HOME:-$HOME/.local/share/pnpm}"
+    ;;
+esac
+
+npm_global_bin="${NPM_CONFIG_PREFIX:-$HOME/.local}/bin"
+case ":$PATH:" in
+  *":$npm_global_bin:"*)
+    check_ok "npm global bin directory is on PATH"
+    ;;
+  *)
+    check_fail "npm global bin directory is missing from PATH: $npm_global_bin"
+    ;;
+esac
+
+if [[ "${NPM_CONFIG_PREFIX:-}" == "$HOME/.local" && -w "${NPM_CONFIG_PREFIX:-}" ]]; then
+  check_ok "npm global prefix is writable"
+else
+  check_fail "npm global prefix is not writable: ${NPM_CONFIG_PREFIX:-unset}"
+fi
+
+if command -v uv >/dev/null 2>&1 && command -v uvx >/dev/null 2>&1; then
+  check_ok "uv and uvx are available"
+else
+  check_fail "uv or uvx is missing"
+fi
+
+if [[ "${UV_CACHE_DIR:-}" == "$HOME/.local/cache/uv" && -w "${UV_CACHE_DIR:-}" ]]; then
+  check_ok "uv cache directory is writable under executable user-local storage"
+else
+  check_fail "uv cache directory is not configured for executable user-local storage: ${UV_CACHE_DIR:-unset}"
+fi
+
+if [[ "${UV_PYTHON_INSTALL_DIR:-}" == "$HOME/.local/share/uv/python" && -w "${UV_PYTHON_INSTALL_DIR:-}" ]]; then
+  check_ok "uv-managed Python install directory is writable"
+else
+  check_fail "uv-managed Python install directory is not writable: ${UV_PYTHON_INSTALL_DIR:-unset}"
+fi
+
+if [[ "${UV_PYTHON_BIN_DIR:-}" == "$HOME/.local/bin" && "${UV_TOOL_BIN_DIR:-}" == "$HOME/.local/bin" ]]; then
+  check_ok "uv executable bin directories point at user-local bin"
+else
+  check_fail "uv executable bin directories are not configured for user-local bin"
+fi
+
+if [[ "${XDG_CONFIG_HOME:-}" == "$HOME/.local/config" && -w "${XDG_CONFIG_HOME:-}" ]]; then
+  check_ok "XDG config directory is writable"
+else
+  check_fail "XDG config directory is not writable: ${XDG_CONFIG_HOME:-unset}"
+fi
+
+if [[ "${GNUPGHOME:-}" == "$HOME/.local/share/gnupg" && -d "${GNUPGHOME:-}" && -w "${GNUPGHOME:-}" && "$(stat -c %a "${GNUPGHOME:-}" 2>/dev/null)" == "700" ]]; then
+  check_ok "GnuPG home is writable"
+else
+  check_fail "GnuPG home is not private and writable: ${GNUPGHOME:-unset}"
+fi
+
+if command -v mise >/dev/null 2>&1; then
+  check_ok "mise is available"
+else
+  check_fail "mise is missing"
+fi
+
+if [[ "${MISE_DATA_DIR:-}" == "$HOME/.local/share/mise" && -w "${MISE_DATA_DIR:-}" ]]; then
+  check_ok "mise data directory is writable under executable user-local storage"
+else
+  check_fail "mise data directory is not writable: ${MISE_DATA_DIR:-unset}"
+fi
+
+case ":$PATH:" in
+  *":${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims:"*)
+    check_ok "mise shims are on PATH"
+    ;;
+  *)
+    check_fail "mise shims are missing from PATH"
+    ;;
+esac
+
+if [[ "${MISE_CONFIG_DIR:-}" == "$HOME/.local/share/mise/config" && -w "${MISE_CONFIG_DIR:-}" ]]; then
+  check_ok "mise config directory is writable for per-user trust/config"
+else
+  check_fail "mise config directory is not writable: ${MISE_CONFIG_DIR:-unset}"
+fi
+
+if [[ -d "${TMPDIR:-$HOME/.local/tmp}" && -w "${TMPDIR:-$HOME/.local/tmp}" ]]; then
+  check_ok "TMPDIR is writable for installers"
+else
+  check_fail "TMPDIR is not writable for installers"
+fi
+
+exec_probe="$HOME/.local/.exec-probe-$$"
+if printf '#!/bin/sh\nexit 0\n' > "$exec_probe" && chmod 700 "$exec_probe" && "$exec_probe"; then
+  check_ok "$HOME/.local allows user-installed executables"
+else
+  check_fail "$HOME/.local is not executable; package-manager installed tools will fail"
+fi
+rm -f "$exec_probe"
+
+if find / -xdev -perm /6000 -type f 2>/dev/null | grep -q .; then
+  check_fail "setuid/setgid files remain in root filesystem"
+else
+  check_ok "no setuid/setgid files found in root filesystem"
+fi
+
+exit "$fail"
+"""
 
 
 def utc_now():
@@ -109,6 +328,351 @@ def cmd_agent_login(args):
     os.execvp(commands[args.agent][0], commands[args.agent])
 
 
+def cmd_bootstrap(args):
+    home = Path.home()
+    for path in [
+        home / ".cache",
+        home / ".npm",
+        home / ".local/bin",
+        home / ".local/cache/zsh",
+        home / ".local/config",
+        home / ".local/config/git",
+        home / ".local/config/shell",
+        home / ".local/cache/mise",
+        home / ".local/cache/uv",
+        home / ".local/state/mise",
+        home / ".local/share/gnupg",
+        home / ".local/share/mise",
+        home / ".local/share/mise/config",
+        home / ".local/share/pnpm/bin",
+        home / ".local/share/uv/python",
+        home / ".local/share/uv/tools",
+        home / ".local/share/headroom",
+    ]:
+        path.mkdir(parents=True, exist_ok=True)
+    (home / ".local/share/gnupg").chmod(0o700)
+
+    headroom_session = os.environ.get("JAIL_HEADROOM_TMUX_SESSION", "headroom")
+    if shutil_which("tmux") and shutil_which("headroom"):
+        if not tmux_ok(["has-session", "-t", f"={headroom_session}"]):
+            tmux(["new-session", "-d", "-s", headroom_session, "-n", "proxy", "/usr/local/bin/headroom-proxy"])
+        tmux(["set-option", "-g", "mouse", "on"], check=False)
+
+    if args.stay:
+        os.execvp("sleep", ["sleep", "infinity"])
+    return 0
+
+
+def shutil_which(command):
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        path = Path(directory) / command
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return ""
+
+
+def cmd_check(_args):
+    return subprocess.run(["bash", "-c", CHECK_SCRIPT]).returncode
+
+
+def tmux(args, check=True):
+    proc = subprocess.run(
+        ["tmux", *args],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and proc.returncode:
+        raise SystemExit(proc.stderr.strip() or f"tmux {' '.join(args)} failed")
+    return proc.stdout
+
+
+def tmux_ok(args):
+    return subprocess.run(["tmux", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def current_session():
+    if not os.environ.get("TMUX"):
+        return ""
+    return tmux(["display-message", "-p", "#{session_name}"], check=False).strip()
+
+
+def managed_sessions():
+    raw = os.environ.get("JAIL_MANAGED_TMUX_SESSIONS", os.environ.get("JAIL_HEADROOM_TMUX_SESSION", "headroom"))
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def tmux_rows(args, fields):
+    fmt = TMUX_SEP.join(f"#{{{field}}}" for field in fields)
+    output = tmux([*args, "-F", fmt])
+    return [dict(zip(fields, line.split(TMUX_SEP))) for line in output.splitlines()]
+
+
+def read_cmdline(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def read_comm(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def proc_table():
+    table = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        close = stat.rfind(")")
+        if close == -1:
+            continue
+        fields = stat[close + 2 :].split()
+        if len(fields) < 20:
+            continue
+        pid = int(entry.name)
+        table[pid] = {
+            "pid": pid,
+            "ppid": int(fields[1]),
+            "starttime": int(fields[19]),
+            "comm": read_comm(pid),
+            "argv": read_cmdline(pid),
+        }
+    return table
+
+
+def process_descendants(root_pid, table):
+    children = {}
+    for proc in table.values():
+        children.setdefault(proc["ppid"], []).append(proc)
+    found = []
+    stack = list(children.get(root_pid, []))
+    while stack:
+        proc = stack.pop(0)
+        found.append(proc)
+        stack.extend(children.get(proc["pid"], []))
+    return found
+
+
+def command_name_for_script(script):
+    script_path = Path(script)
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / script_path.name
+        try:
+            if candidate.exists() and candidate.resolve() == script_path.resolve():
+                return candidate.name
+        except OSError:
+            continue
+    return ""
+
+
+def compact_argv(argv):
+    if len(argv) >= 2 and Path(argv[1]).exists():
+        resolved = command_name_for_script(argv[1])
+        if resolved:
+            return [resolved, *argv[2:]]
+    return argv
+
+
+def process_snapshot(root_pid, table, ignored_pids):
+    processes = []
+    for proc in sorted(process_descendants(root_pid, table), key=lambda item: (item["starttime"], item["pid"])):
+        if proc["pid"] in ignored_pids or not proc["argv"]:
+            continue
+        compact = compact_argv(proc["argv"])
+        processes.append({
+            "pid": proc["pid"],
+            "ppid": proc["ppid"],
+            "comm": proc["comm"],
+            "argv": proc["argv"],
+            "cmdline": shlex.join(compact),
+        })
+    detected = processes[-1]["cmdline"] if processes else ""
+    return processes, detected
+
+
+def cmd_tmux_snapshot(args):
+    sessions = []
+    table = proc_table()
+    ignored_pids = {os.getpid(), os.getppid()}
+    ignored_pids.update(proc["pid"] for proc in process_descendants(os.getpid(), table))
+    active_session = current_session()
+    excluded_sessions = set() if args.include_managed else managed_sessions()
+
+    for session_row in tmux_rows(["list-sessions"], ["session_name", "session_created_string", "session_attached"]):
+        session_name = session_row["session_name"]
+        if session_name in excluded_sessions:
+            continue
+        windows = []
+        for window_row in tmux_rows(
+            ["list-windows", "-t", session_name],
+            ["window_index", "window_name", "window_active", "window_layout"],
+        ):
+            window_target = f"{session_name}:{window_row['window_index']}"
+            panes = []
+            for pane_row in tmux_rows(
+                ["list-panes", "-t", window_target],
+                [
+                    "pane_index",
+                    "pane_id",
+                    "pane_active",
+                    "pane_current_path",
+                    "pane_current_command",
+                    "pane_title",
+                    "pane_width",
+                    "pane_height",
+                    "pane_pid",
+                ],
+            ):
+                pane_pid = int(pane_row["pane_pid"] or 0)
+                process_tree, detected_command = process_snapshot(pane_pid, table, ignored_pids)
+                panes.append({
+                    "index": int(pane_row["pane_index"]),
+                    "id": pane_row["pane_id"],
+                    "pid": pane_pid,
+                    "active": pane_row["pane_active"] == "1",
+                    "cwd": pane_row["pane_current_path"],
+                    "title": pane_row["pane_title"],
+                    "tmux_process": pane_row["pane_current_command"],
+                    "processes": process_tree,
+                    "size": {
+                        "width": int(pane_row["pane_width"] or 0),
+                        "height": int(pane_row["pane_height"] or 0),
+                    },
+                    "command": "" if args.no_commands else detected_command,
+                })
+            windows.append({
+                "index": int(window_row["window_index"]),
+                "name": window_row["window_name"],
+                "active": window_row["window_active"] == "1",
+                "layout": window_row["window_layout"],
+                "panes": panes,
+            })
+        sessions.append({
+            "name": session_name,
+            "created": session_row["session_created_string"],
+            "attached": session_row["session_attached"] == "1",
+            "current": session_name == active_session,
+            "windows": windows,
+        })
+
+    data = {
+        "version": 1,
+        "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "current_session": "" if active_session in excluded_sessions else active_session,
+        "note": "Edit pane.command before restore when the detected command is not what should be restarted.",
+        "sessions": sessions,
+    }
+    args.path.parent.mkdir(parents=True, exist_ok=True)
+    args.path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {args.path}")
+    print(f"captured {len(sessions)} session(s)")
+
+
+def pane_cwd(window, pane_index):
+    for pane in window.get("panes") or []:
+        if int(pane.get("index", -1)) == pane_index:
+            return pane.get("cwd") or str(Path.home())
+    return str(Path.home())
+
+
+def create_session(session_name, first_window):
+    tmux(["new-session", "-d", "-s", session_name, "-n", first_window.get("name") or "0", "-c", pane_cwd(first_window, 0)])
+
+
+def restore_session(session, target_name):
+    windows = sorted(session.get("windows") or [], key=lambda item: int(item.get("index", 0)))
+    if not windows:
+        return
+    create_session(target_name, windows[0])
+    for offset, window in enumerate(windows):
+        window_index = int(window.get("index", offset))
+        target_window = f"{target_name}:{window_index}"
+        panes = sorted(window.get("panes") or [], key=lambda item: int(item.get("index", 0)))
+        if offset == 0:
+            tmux(["move-window", "-s", f"{target_name}:0", "-t", target_window], check=False)
+            tmux(["rename-window", "-t", target_window, window.get("name") or str(window_index)])
+        else:
+            tmux(["new-window", "-t", target_window, "-n", window.get("name") or str(window_index), "-c", pane_cwd(window, 0)])
+
+        for pane in panes[1:]:
+            tmux(["split-window", "-t", target_window, "-c", pane.get("cwd") or str(Path.home())])
+
+        if window.get("layout"):
+            tmux(["select-layout", "-t", target_window, window["layout"]], check=False)
+
+        for pane in panes:
+            pane_target = f"{target_window}.{int(pane.get('index', 0))}"
+            if pane.get("cwd"):
+                tmux(["send-keys", "-t", pane_target, f"cd {shlex.quote(pane['cwd'])}", "C-m"])
+            if pane.get("title"):
+                tmux(["select-pane", "-t", pane_target, "-T", pane["title"]], check=False)
+            if pane.get("command"):
+                tmux(["send-keys", "-t", pane_target, pane["command"], "C-m"])
+
+        active_pane = next((pane for pane in panes if pane.get("active")), None)
+        if active_pane:
+            tmux(["select-pane", "-t", f"{target_window}.{int(active_pane.get('index', 0))}"], check=False)
+
+    active_window = next((window for window in windows if window.get("active")), None)
+    if active_window:
+        tmux(["select-window", "-t", f"{target_name}:{int(active_window.get('index', 0))}"], check=False)
+
+
+def cmd_tmux_restore(args):
+    if not args.path.exists():
+        raise SystemExit(f"snapshot not found: {args.path}")
+    data = json.loads(args.path.read_text(encoding="utf-8"))
+    active_now = current_session()
+    restored_current = data.get("current_session") or ""
+    temp_names = {}
+    old_current_name = ""
+
+    excluded_sessions = set() if args.include_managed else managed_sessions()
+    sessions = [
+        session
+        for session in data.get("sessions", [])
+        if session.get("name") not in excluded_sessions
+    ]
+
+    for session in sessions:
+        original_name = session["name"]
+        target_name = f"{args.prefix}{original_name}" if args.prefix else original_name
+        restore_name = target_name
+        is_current_target = bool(active_now and active_now == target_name)
+        if is_current_target:
+            restore_name = f"__jail_restore_{target_name}_{uuid.uuid4().hex[:8]}"
+            old_current_name = f"__jail_old_{target_name}_{uuid.uuid4().hex[:8]}"
+            temp_names[restore_name] = target_name
+        elif tmux_ok(["has-session", "-t", f"={target_name}"]):
+            tmux(["kill-session", "-t", f"={target_name}"])
+
+        restore_session(session, restore_name)
+
+    for temp_name, target_name in temp_names.items():
+        if tmux_ok(["has-session", "-t", f"={target_name}"]):
+            tmux(["rename-session", "-t", f"={target_name}", old_current_name])
+        tmux(["rename-session", "-t", f"={temp_name}", target_name])
+        if active_now == target_name:
+            tmux(["switch-client", "-t", f"={target_name}"], check=False)
+            tmux(["kill-session", "-t", f"={old_current_name}"], check=False)
+
+    if restored_current:
+        target_current = f"{args.prefix}{restored_current}" if args.prefix else restored_current
+        tmux(["switch-client", "-t", f"={target_current}"], check=False)
+
+    print(f"restored {len(sessions)} session(s)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Jail convenience commands")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -121,6 +685,28 @@ def main():
     agent.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
     agent.add_argument("--no-exec", action="store_true", help="only create the request")
     agent.set_defaults(func=cmd_agent_login)
+
+    bootstrap = sub.add_parser("bootstrap", help="initialize safe runtime directories and managed services")
+    bootstrap.add_argument("--stay", action="store_true", help=argparse.SUPPRESS)
+    bootstrap.set_defaults(func=cmd_bootstrap)
+
+    check = sub.add_parser("check", help="verify jail hardening assumptions")
+    check.set_defaults(func=cmd_check)
+
+    tmux_parser = sub.add_parser("tmux", help="snapshot and restore tmux sessions")
+    tmux_sub = tmux_parser.add_subparsers(dest="tmux_command", required=True)
+
+    snap = tmux_sub.add_parser("snapshot", help="snapshot all tmux sessions")
+    snap.add_argument("--path", type=Path, default=DEFAULT_TMUX_LAYOUT)
+    snap.add_argument("--no-commands", action="store_true", help="leave pane.command empty instead of using detected argv")
+    snap.add_argument("--include-managed", action="store_true", help=argparse.SUPPRESS)
+    snap.set_defaults(func=cmd_tmux_snapshot)
+
+    restore = tmux_sub.add_parser("restore", help="restore all tmux sessions from the snapshot")
+    restore.add_argument("--path", type=Path, default=DEFAULT_TMUX_LAYOUT)
+    restore.add_argument("--prefix", default="", help=argparse.SUPPRESS)
+    restore.add_argument("--include-managed", action="store_true", help=argparse.SUPPRESS)
+    restore.set_defaults(func=cmd_tmux_restore)
 
     args = parser.parse_args()
     return args.func(args)
