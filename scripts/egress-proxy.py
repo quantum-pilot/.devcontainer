@@ -292,7 +292,7 @@ Attempted: {protocol_text} {host}:{port}
 Target: {target}
 Reason: {reason}
 
-Use one of these request paths instead of retrying direct network commands:
+Use these paths instead of retrying direct network commands:
 
   Generic HTTPS/TCP egress:
     A pending request has been created automatically when possible.
@@ -304,8 +304,8 @@ Use one of these request paths instead of retrying direct network commands:
       .devcontainer/host/jail-operator
 
   Agent login:
-    jailctl agent-login codex
-    jailctl agent-login claude
+    jail agent-login codex
+    jail agent-login claude
 
   SSH:
     ssh <target-or-alias>

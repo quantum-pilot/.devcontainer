@@ -173,14 +173,14 @@ RUN mkdir -p \
     /shell_history \
     /workspace
 
-COPY scripts/jailctl /usr/local/bin/jailctl
+COPY scripts/jail /usr/local/bin/jail
 COPY scripts/ssh /usr/local/bin/ssh
 COPY scripts/headroom-proxy /usr/local/bin/headroom-proxy
 COPY scripts/jail-start /usr/local/bin/jail-start
 COPY scripts/jail-hardening-check /usr/local/bin/jail-hardening-check
 COPY scripts/jail-tmux /usr/local/bin/jail-tmux
 RUN chmod 0755 \
-  /usr/local/bin/jailctl \
+  /usr/local/bin/jail \
   /usr/local/bin/ssh \
   /usr/local/bin/headroom-proxy \
   /usr/local/bin/jail-start \

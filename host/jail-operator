@@ -80,43 +80,10 @@ PRESETS = {
         {"host_suffix": ".chatgpt.com", "port": 443, "protocols": ["connect"]},
         {"host": "api.openai.com", "port": 443, "protocols": ["connect"]},
     ],
-    "codex-runtime": [
-        {"host": "api.openai.com", "port": 443, "protocols": ["connect"]},
-        {"host_suffix": ".openai.com", "port": 443, "protocols": ["connect"]},
-    ],
     "claude-login": [
         {"host_suffix": ".anthropic.com", "port": 443, "protocols": ["connect"]},
         {"host": "claude.ai", "port": 443, "protocols": ["connect"]},
     ],
-    "claude-runtime": [
-        {"host": "api.anthropic.com", "port": 443, "protocols": ["connect"]},
-        {"host_suffix": ".anthropic.com", "port": 443, "protocols": ["connect"]},
-    ],
-    "npm-registry": [
-        {"host": "registry.npmjs.org", "port": 443, "protocols": ["connect"]},
-        {"host_suffix": ".npmjs.org", "port": 443, "protocols": ["connect"]},
-    ],
-    "pypi": [
-        {"host": "pypi.org", "port": 443, "protocols": ["connect"]},
-        {"host": "files.pythonhosted.org", "port": 443, "protocols": ["connect"]},
-        {"host_suffix": ".pythonhosted.org", "port": 443, "protocols": ["connect"]},
-    ],
-    "github-https": [
-        {"host": "github.com", "port": 443, "protocols": ["connect"]},
-        {"host_suffix": ".github.com", "port": 443, "protocols": ["connect"]},
-        {"host_suffix": ".githubusercontent.com", "port": 443, "protocols": ["connect"]},
-    ],
-}
-
-INSTALL_PRESETS = {
-    "npm": "npm-registry",
-    "pnpm": "npm-registry",
-    "yarn": "npm-registry",
-    "pip": "pypi",
-    "uv": "pypi",
-    "cargo": "github-https",
-    "go": "github-https",
-    "mise": "github-https",
 }
 
 
@@ -782,8 +749,6 @@ def rules_for_request(request):
     payload = request.get("payload", {})
     if kind == "egress":
         return egress_rules_from_request(request)
-    if kind == "install":
-        return preset_rules(INSTALL_PRESETS.get(payload.get("manager"), "github-https"))
     if kind == "agent-login":
         agent = payload.get("agent")
         return preset_rules(f"{agent}-login")

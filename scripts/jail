@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import sys
+import time
+import uuid
+
+
+REQUEST_DIR = pathlib.Path(os.environ.get("JAIL_REQUEST_DIR", "/jail-requests"))
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def request_dedupe_key(agent):
+    return hashlib.sha256(f"agent-login:{agent}".encode("utf-8")).hexdigest()[:16]
+
+
+def pending_request_path(dedupe_key):
+    for path in REQUEST_DIR.glob("*.json"):
+        request = read_json(path)
+        if isinstance(request, dict) and request.get("status", "pending") == "pending" and request.get("dedupe_key") == dedupe_key:
+            return path
+    return None
+
+
+def write_agent_login_request(agent, ttl, reason):
+    REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    dedupe_key = request_dedupe_key(agent)
+    now = utc_now().isoformat()
+    path = pending_request_path(dedupe_key)
+    if path:
+        request = read_json(path) or {}
+        request["last_seen_at"] = now
+        request["seen_count"] = int(request.get("seen_count") or 1) + 1
+    else:
+        request_id = f"{utc_now().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+        path = REQUEST_DIR / f"{request_id}.json"
+        request = {
+            "id": request_id,
+            "kind": "agent-login",
+            "status": "pending",
+            "dedupe_key": dedupe_key,
+            "created_at": now,
+            "seen_count": 1,
+            "cwd": os.getcwd(),
+        }
+    request["payload"] = {
+        "agent": agent,
+        "ttl": ttl,
+        "reason": reason or f"{agent} login/runtime bootstrap",
+    }
+    request["last_seen_at"] = now
+    path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o666)
+    except OSError:
+        pass
+    print(f"request {'merged' if request.get('seen_count', 1) > 1 else 'written'}: {path}", flush=True)
+    print("approve from the host with .devcontainer/host/jail-operator", flush=True)
+    return path
+
+
+def wait_for_resolution(path, timeout):
+    deadline = time.time() + timeout if timeout else None
+    while True:
+        request = read_json(path) or {}
+        status = request.get("status", "pending")
+        if status == "approved":
+            print(f"request approved: {path.name}", flush=True)
+            return 0
+        if status == "denied":
+            print(f"request denied: {request.get('decision_reason', '')}".rstrip(), file=sys.stderr)
+            return 1
+        if deadline and time.time() >= deadline:
+            print(f"timed out waiting for approval: {path}", file=sys.stderr)
+            return 124
+        time.sleep(1)
+
+
+def cmd_agent_login(args):
+    commands = {
+        "claude": ["claude"],
+        "codex": ["codex", "login"],
+    }
+    path = write_agent_login_request(args.agent, args.ttl, args.reason)
+    if not args.no_wait:
+        status = wait_for_resolution(path, args.wait_timeout)
+        if status != 0:
+            return status
+    if args.no_exec:
+        return 0
+    if args.agent == "claude":
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+    if args.agent == "codex":
+        os.environ.pop("OPENAI_BASE_URL", None)
+    os.execvp(commands[args.agent][0], commands[args.agent])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Jail convenience commands")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    agent = sub.add_parser("agent-login", help="request login egress and run an agent login command")
+    agent.add_argument("agent", choices=["claude", "codex"])
+    agent.add_argument("--ttl", default="30m")
+    agent.add_argument("--reason", default="")
+    agent.add_argument("--no-wait", action="store_true", help="do not wait for approval before launching the CLI")
+    agent.add_argument("--wait-timeout", type=int, default=0, help="seconds to wait; 0 waits forever")
+    agent.add_argument("--no-exec", action="store_true", help="only create the request")
+    agent.set_defaults(func=cmd_agent_login)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

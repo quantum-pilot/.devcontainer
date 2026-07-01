@@ -64,9 +64,10 @@ request directory as file-based IPC.
 
 Requests are JSON files in `$DEVCONTAINER_JAIL_HOME/requests`.
 
-The worker writes requests through `jailctl`. The egress proxy writes automatic
-egress requests when a default-denied proxy-aware connection arrives. The host
-operator live-refreshes this directory and marks requests approved or denied.
+The egress proxy and SSH broker write automatic requests when default-denied
+connections arrive. The worker `jail agent-login` helper writes agent login
+requests. The host operator live-refreshes this directory and marks requests
+approved or denied.
 
 Pending requests include `dedupe_key`, `created_at`, `last_seen_at`, and
 `seen_count`. Repeated attempts for the same target merge into the existing
@@ -235,8 +236,8 @@ OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 `headroom-proxy` unsets those variables before starting Headroom so the proxy
 does not route upstream requests back into itself.
 
-`jailctl agent-login claude` unsets `ANTHROPIC_BASE_URL` for the login command,
-and `jailctl agent-login codex` unsets `OPENAI_BASE_URL`, so authentication can
+`jail agent-login claude` unsets `ANTHROPIC_BASE_URL` for the login command,
+and `jail agent-login codex` unsets `OPENAI_BASE_URL`, so authentication can
 use the official upstream login paths.
 
 ## Package Managers

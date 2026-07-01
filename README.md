@@ -70,9 +70,13 @@ SSH sessions appear in the `sessions` view.
 Run agent login inside the worker:
 
 ```bash
-jailctl agent-login codex
-jailctl agent-login claude
+jail agent-login codex
+jail agent-login claude
 ```
+
+> This bypasses Headroom for auth by running the equivalent of
+> `env -u OPENAI_BASE_URL codex login` or
+> `env -u ANTHROPIC_BASE_URL claude`.
 
 Agent state is kept in jail-owned Docker volumes, not mounted from your host
 agent config directories.
