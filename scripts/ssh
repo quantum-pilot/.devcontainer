@@ -44,6 +44,14 @@ RISKY_OPTION_KEYS = {
     "stdioforwardhost",
     "stdioforwardport",
 }
+SAFE_OPTION_VALUES = {
+    "clearallforwardings": {"yes"},
+    "forwardagent": {"no"},
+    "forwardx11": {"no"},
+    "permitlocalcommand": {"no"},
+    "remotecommand": {"none"},
+    "requesttty": {"no"},
+}
 
 
 class SSHUsageError(Exception):
@@ -122,12 +130,23 @@ def looks_like_direct_target(target):
 
 
 def option_key(raw):
-    key = raw.split("=", 1)[0].strip().lower()
+    key = raw.strip().lower()
     return key.replace("-", "")
 
 
+def split_o_option(raw):
+    if "=" in raw:
+        key, value = raw.split("=", 1)
+    else:
+        key, _, value = raw.partition(" ")
+    return option_key(key), value.strip().lower()
+
+
 def validate_o_option(raw):
-    if option_key(raw) in RISKY_OPTION_KEYS:
+    key, value = split_o_option(raw)
+    if value in SAFE_OPTION_VALUES.get(key, set()):
+        return
+    if key in RISKY_OPTION_KEYS:
         raise SSHUsageError(f"unsupported unsafe -o option: {raw}")
 
 
@@ -162,8 +181,6 @@ def parse_argv(argv):
             break
         if arg in RISKY_SHORT_WITH_ARG:
             raise SSHUsageError(f"unsupported unsafe SSH option: {arg}")
-        if any(flag in RISKY_SHORT_FLAGS for flag in arg[1:]):
-            raise SSHUsageError(f"unsupported unsafe SSH option: {arg}")
         if arg == "-i" or arg.startswith("-i"):
             raise SSHUsageError("-i is host-side policy; add an SSH alias with an identity file in the operator")
         if arg == "-S" or arg.startswith("-S"):
@@ -177,6 +194,9 @@ def parse_argv(argv):
                 user = value
             elif matched_arg_option == "-o":
                 validate_o_option(value)
+                key, option_value = split_o_option(value)
+                if key == "port" and option_value:
+                    port = int(option_value)
                 safe_options.extend(["-o", value])
             elif matched_arg_option == "-F":
                 if value not in {"none", "/dev/null"}:
@@ -185,6 +205,8 @@ def parse_argv(argv):
             else:
                 safe_options.extend([matched_arg_option, value])
             continue
+        if any(flag in RISKY_SHORT_FLAGS for flag in arg[1:]):
+            raise SSHUsageError(f"unsupported unsafe SSH option: {arg}")
         for flag in arg[1:]:
             if flag not in SAFE_SHORT_FLAGS:
                 raise SSHUsageError(f"unsupported SSH option: -{flag}")
