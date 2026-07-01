@@ -233,7 +233,7 @@ def parse_argv(argv):
 
 def winsize():
     try:
-        rows, cols = os.get_terminal_size(sys.stdin.fileno())
+        cols, rows = os.get_terminal_size(sys.stdin.fileno())
         return {"rows": rows, "cols": cols}
     except OSError:
         return {"rows": 24, "cols": 80}
