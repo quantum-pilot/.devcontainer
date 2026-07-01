@@ -485,15 +485,20 @@ class ProxyHandler(socketserver.StreamRequestHandler):
     def relay(self, upstream):
         sockets = [self.connection, upstream]
         try:
-            while True:
+            while sockets:
                 readable, _, _ = select.select(sockets, [], [], self.timeout)
                 if not readable:
                     return
                 for sock in readable:
                     data = sock.recv(BUFFER_SIZE)
-                    if not data:
-                        return
                     other = upstream if sock is self.connection else self.connection
+                    if not data:
+                        sockets.remove(sock)
+                        try:
+                            other.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        continue
                     other.sendall(data)
         finally:
             upstream.close()
