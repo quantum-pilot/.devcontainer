@@ -1326,7 +1326,7 @@ def pump_socket_to_pipe(sock, stdin_pipe, send_lock):
 def pump_pipe_to_socket(pipe, sock, channel, send_lock):
     try:
         while True:
-            data = pipe.read(32768)
+            data = os.read(pipe.fileno(), 32768)
             if not data:
                 break
             frame_send(sock, channel, data, send_lock)

@@ -96,7 +96,12 @@ RUN mkdir -p \
   && ln -sf /home/${USERNAME}/.local/config/shell/zshrc /home/${USERNAME}/.zshrc.local \
   && ln -sfn /home/${USERNAME}/.local/share/headroom /home/${USERNAME}/.headroom \
   && touch /shell_history/.zsh_history \
-  && printf '%s\n' 'set -g mouse on' > /home/${USERNAME}/.tmux.conf \
+  && printf '%s\n' \
+    'set -g mouse on' \
+    'bind c new-window -c "#{pane_current_path}"' \
+    'bind % split-window -h -c "#{pane_current_path}"' \
+    'bind " split-window -v -c "#{pane_current_path}"' \
+    > /home/${USERNAME}/.tmux.conf \
   && printf '%s\n' \
     'export HISTFILE=/shell_history/.zsh_history' \
     'export SAVEHIST=1000000000' \
