@@ -2204,6 +2204,11 @@ def app(stdscr):
 
 
 def main():
+    if os.environ.get("DEVCONTAINER") == "true":
+        raise SystemExit(
+            "jail-operator must be run on the host machine, not inside the devcontainer.\n"
+            "From the project root on the host, run: .devcontainer/host/jail-operator"
+        )
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise SystemExit("jail-operator requires an interactive terminal")
     POLICY_DIR.mkdir(parents=True, exist_ok=True)

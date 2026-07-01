@@ -65,38 +65,6 @@ be revoked or moved between finite TTLs and `forever`. Active SSH leases appear
 in the `leases` view with their TTLs and can be revoked there. Recent brokered
 SSH sessions appear in the `sessions` view.
 
-## Network Access
-
-Proxy-aware network requests are default-deny. Unknown HTTP/HTTPS targets create
-or update one pending request per target. If approved before the client times
-out, the original request continues.
-
-Host raw-TCP services configured in `customizations.jail.bridgePorts` are
-reachable at `proxy:<port>`. For example, Postgres on the host at `5432` should
-use `proxy:5432` from inside the worker.
-
-For package-manager work, run the install through `jailctl`:
-
-```bash
-jailctl install --run pnpm install --frozen-lockfile
-jailctl install --run uv sync
-jailctl install --run npm ci
-jailctl install --run uv pip install -r requirements.txt
-```
-
-`pnpm`, `uv`/`uvx`, Claude Code, Codex CLI, Graphify, GSD Core, Headroom, and
-Ponytail are installed in the worker image.
-
-Node/JavaScript tooling is enabled by default. `pnpm`, `uv`, and `mise` are the
-preferred package and toolchain managers.
-
-Install Python with `uv` or `mise`, and Go/Rust with `mise`, on demand inside
-the worker. The alias `m` is available for `mise`. User and per-repo toolchain
-state lives under persisted `/home/node/.local` paths.
-
-For shell customizations, edit `~/.zshrc.local`; it is persisted under
-`/home/node/.local/config/shell/zshrc` and sourced on startup.
-
 ## Agent Login
 
 Run agent login inside the worker:
@@ -109,10 +77,28 @@ jailctl agent-login claude
 Agent state is kept in jail-owned Docker volumes, not mounted from your host
 agent config directories.
 
-## Headroom
+## Network Access
 
-Headroom starts automatically in a detached worker tmux session named by
-`JAIL_HEADROOM_TMUX_SESSION`.
+Proxy-aware network requests are default-deny. Unknown HTTP/HTTPS targets create
+or update one pending request per target. If approved before the client times
+out, the original request continues.
+
+Host raw-TCP services configured in `customizations.jail.bridgePorts` are
+reachable at `proxy:<port>`. For example, Postgres on the host at `5432` should
+use `proxy:5432` from inside the worker.
+
+For package-manager work, run the package manager normally. Unknown network
+targets will appear in the operator for approval.
+
+Node/JavaScript tooling is enabled by default. `pnpm`, `uv`, and `mise` are the
+preferred package and toolchain managers.
+
+Install Python with `uv` or `mise`, and Go/Rust with `mise`, on demand inside
+the worker. The alias `m` is available for `mise`. User and per-repo toolchain
+state lives under persisted `/home/node/.local` paths.
+
+For shell customizations, edit `~/.zshrc.local`; it is persisted under
+`/home/node/.local/config/shell/zshrc` and sourced on startup.
 
 ## tmux Layouts
 
@@ -130,14 +116,6 @@ commands, except managed sessions listed in `JAIL_MANAGED_TMUX_SESSIONS`, which
 are started automatically.
 Edit a pane's `command` field before restore when needed.
 
-## Ponytail
-
-Ponytail is installed, but plugins are not silently trusted. Install plugins
-from the agent UI or CLI.
-
-If plugin installation needs GitHub, approve that egress request in the
-operator.
-
 ## SSH
 
 SSH keys stay on the host. The worker has no private keys and no raw
@@ -153,13 +131,6 @@ ssh git@github.com
 The first matching invocation creates a pending SSH request. If approved, the
 host broker runs real host SSH and relays stdin/stdout/stderr back to the jailed
 process. Git uses the same path through `GIT_SSH=/usr/local/bin/ssh`.
-
-For scoped lease approval:
-
-```bash
-jailctl ssh-lease staging-readonly --ttl 30m --wait
-jailctl ssh-lease root@100.75.201.20 --ttl 4h --wait
-```
 
 Forwarding and proxy-style SSH features are intentionally denied by the broker.
 
@@ -179,3 +150,21 @@ Agents can connect to the host browser's CDP endpoint at:
 ```text
 http://host.docker.internal:9222
 ```
+
+## Agent Tooling
+
+The worker image includes:
+
+- [Claude Code](https://github.com/anthropics/claude-code)
+- [Codex CLI](https://github.com/openai/codex)
+- [Headroom](https://github.com/headroomlabs-ai/headroom)
+- [Ponytail](https://github.com/DietrichGebert/ponytail)
+- [Graphify](https://github.com/rhanka/graphify)
+- [GSD Core](https://github.com/open-gsd/gsd-core)
+
+Headroom starts automatically in a detached worker tmux session named by
+`JAIL_HEADROOM_TMUX_SESSION`.
+
+Ponytail is installed, but plugins are not silently trusted. Install plugins
+from the agent UI or CLI. If plugin installation needs GitHub, approve that
+egress request in the operator.

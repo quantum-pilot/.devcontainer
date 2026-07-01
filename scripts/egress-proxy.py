@@ -300,10 +300,8 @@ Use one of these request paths instead of retrying direct network commands:
       .devcontainer/host/jail-operator
 
   Package/tool installs:
-    jailctl install --run pnpm install --frozen-lockfile
-    jailctl install --run uv sync
-    jailctl install --run cargo fetch
-    jailctl install --run go mod download
+    Run the package manager normally, then approve the pending target here:
+      .devcontainer/host/jail-operator
 
   Agent login:
     jailctl agent-login codex
@@ -311,7 +309,6 @@ Use one of these request paths instead of retrying direct network commands:
 
   SSH:
     ssh <target-or-alias>
-    jailctl ssh-lease <approved-alias> --ttl 30m --wait
 
 Host approval:
 
@@ -385,7 +382,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             "target": target,
             "guidance": {
                 "egress": ".devcontainer/host/jail-operator",
-                "install": "jailctl install --run <manager> <args...>",
+                "install": "run the package manager normally; approve pending targets in the operator",
                 "ssh": "ssh <target-or-alias>",
             },
         }

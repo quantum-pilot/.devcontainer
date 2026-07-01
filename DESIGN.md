@@ -241,9 +241,9 @@ use the official upstream login paths.
 
 ## Package Managers
 
-`jailctl install --run ...` creates an install request, waits for approval, and
-executes the package-manager command in the same worker TTY. The request records
-the manager, arguments, current project path, and known lockfile hashes.
+Package managers run normally inside the worker. Unknown network targets create
+operator requests through the egress proxy and continue if approved before the
+client times out.
 
 The default image is Node/JavaScript first. It installs Node, npm, pnpm, uv/uvx,
 Claude Code, Codex CLI, Graphify, GSD Core, Headroom, Ponytail, and mise.
