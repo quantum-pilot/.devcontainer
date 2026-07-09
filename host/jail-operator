@@ -290,6 +290,17 @@ def prune_expired_ssh_leases():
     return removed
 
 
+def clear_ssh_leases():
+    removed = 0
+    for path in LEASE_DIR.glob("*.json"):
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def active_ssh_leases():
     now = utc_now()
     rows = []
@@ -2329,6 +2340,7 @@ def main():
     REQUEST_DIR.mkdir(parents=True, exist_ok=True)
     LEASE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    clear_ssh_leases()
     start_ssh_broker()
     try:
         curses.wrapper(app)

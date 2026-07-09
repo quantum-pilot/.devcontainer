@@ -24,6 +24,7 @@ BODY_METHODS = {"POST", "PUT", "PATCH"}
 WAIT_FOR_APPROVAL = os.environ.get("EGRESS_WAIT_FOR_APPROVAL", "true").lower() not in {"0", "false", "no"}
 APPROVAL_WAIT_TIMEOUT = int(os.environ.get("EGRESS_APPROVAL_WAIT_TIMEOUT", "0"))
 APPROVAL_POLL_SECONDS = float(os.environ.get("EGRESS_APPROVAL_POLL_SECONDS", "1"))
+RELAY_IDLE_TIMEOUT = float(os.environ.get("EGRESS_RELAY_IDLE_TIMEOUT", "3600"))
 
 
 def utc_now():
@@ -319,7 +320,7 @@ Direct egress is blocked by design. Do not retry direct installs/downloads repea
 
 
 class ProxyHandler(socketserver.StreamRequestHandler):
-    timeout = 30
+    timeout = RELAY_IDLE_TIMEOUT
 
     def handle(self):
         request_line = self.rfile.readline(65536).decode("iso-8859-1").strip()
@@ -488,7 +489,7 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             while sockets:
                 readable, _, _ = select.select(sockets, [], [], self.timeout)
                 if not readable:
-                    return
+                    continue
                 for sock in readable:
                     data = sock.recv(BUFFER_SIZE)
                     other = upstream if sock is self.connection else self.connection
