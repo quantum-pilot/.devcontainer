@@ -606,9 +606,11 @@ def restore_session(session, target_name):
 
         for pane in panes[1:]:
             tmux(["split-window", "-t", target_window, "-c", pane.get("cwd") or str(Path.home())])
+            tmux(["select-layout", "-t", target_window, "tiled"])
 
         if window.get("layout"):
             tmux(["select-layout", "-t", target_window, window["layout"]], check=False)
+        tmux(["set-option", "-w", "-t", target_window, "window-size", "latest"])
 
         for pane in panes:
             pane_target = f"{target_window}.{int(pane.get('index', 0))}"
